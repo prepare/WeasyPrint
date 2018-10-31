@@ -1,40 +1,47 @@
-# coding: utf8
 """
     weasyprint.tests.testing_utils
     ------------------------------
 
     Helpers for tests.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals, print_function
-
-import sys
-import os.path
-import logging
 import contextlib
 import functools
-import wsgiref.simple_server
+import logging
+import os.path
+import sys
 import threading
-import shutil
-import tempfile
+import wsgiref.simple_server
 
-from .. import HTML, CSS
+import pytest
+
+from .. import CSS, HTML, text
 from ..logger import LOGGER
+from ..urls import path2url
 
-
-# TODO: find a way to not depend on a specific font
-FONTS = 'Liberation Sans, Arial'
+# Lists of fonts with many variants (including condensed)
+if sys.platform.startswith('win'):
+    SANS_FONTS = 'Arial Nova, Arial, sans'
+    MONO_FONTS = 'Courier New, Courier, monospace'
+elif sys.platform.startswith('darwin'):
+    # Pango on macOS doesn't handle multiple fonts
+    # See https://github.com/Kozea/WeasyPrint/issues/158
+    SANS_FONTS = 'DejaVu Sans'
+    MONO_FONTS = 'Courier New'
+else:
+    SANS_FONTS = 'DejaVu Sans, sans'
+    MONO_FONTS = 'DejaVu Sans Mono, monospace'
 
 TEST_UA_STYLESHEET = CSS(filename=os.path.join(
     os.path.dirname(__file__), '..', 'css', 'tests_ua.css'
 ))
 
 
-class TestHTML(HTML):
+class FakeHTML(HTML):
     """Like weasyprint.HTML, but with a lighter UA stylesheet."""
     def _ua_stylesheets(self):
         return [TEST_UA_STYLESHEET]
@@ -43,6 +50,10 @@ class TestHTML(HTML):
 def resource_filename(basename):
     """Return the absolute path of the resource called ``basename``."""
     return os.path.join(os.path.dirname(__file__), 'resources', basename)
+
+
+# Dummy filename, but in the right directory.
+BASE_URL = path2url(resource_filename('<test>'))
 
 
 class CallbackHandler(logging.Handler):
@@ -85,21 +96,11 @@ def assert_no_logs(function):
                         print(message, file=sys.stderr)
                 raise
             else:
-                if logs:
+                if logs:  # pragma: no cover
                     for message in logs:
                         print(message, file=sys.stderr)
                     raise AssertionError('%i errors logged' % len(logs))
     return wrapper
-
-
-def almost_equal(a, b):
-    if (isinstance(a, list) and isinstance(b, list)
-            or isinstance(a, tuple) and isinstance(b, tuple)):
-        return len(a) == len(b) and all(
-            almost_equal(aa, bb) for aa, bb in zip(a, b))
-    if isinstance(a, float) or isinstance(b, float):
-        return round(abs(a - b), 6) == 0
-    return a == b
 
 
 @contextlib.contextmanager
@@ -110,7 +111,7 @@ def http_server(handlers):
             status = str('200 OK')
             response, headers = handler(environ)
             headers = [(str(name), str(value)) for name, value in headers]
-        else:
+        else:  # pragma: no cover
             status = str('404 Not Found')
             response = b''
             headers = []
@@ -130,15 +131,13 @@ def http_server(handlers):
         thread.join()
 
 
-@contextlib.contextmanager
-def temp_directory():
-    """Context manager that gives the path to a new temporary directory.
-
-    Remove everything on exiting the context.
-
-    """
-    directory = tempfile.mkdtemp()
-    try:
-        yield directory
-    finally:
-        shutil.rmtree(directory)
+def requires(library_name, expected_tuple):
+    library = getattr(text, library_name)
+    library_version = '%06i' % getattr(library, '%s_version' % library_name)()
+    library_tuple = tuple(int(i) for i in (
+        library_version[:2], library_version[2:4], library_version[4:]))
+    return pytest.mark.skipif(
+        library_tuple < expected_tuple,
+        reason='Running %s %s but this test requires %s+' % (
+            library_name, '%i.%i.%i' % library_tuple,
+            '%i.%i.%i' % expected_tuple))

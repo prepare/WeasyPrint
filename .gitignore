@@ -1,13 +1,23 @@
+# Python Bytecode
 *.pyc
+
+# Building and Distributing
 /*.egg-info
-/.coverage
-/htmlcov
-/coverage.xml
-/.tox
+/.eggs
+/build
 /dist
+/docs/_build
+
+# Various Tools
+/.coverage
+/coverage.xml
+/htmlcov
 /env
 /venv
-/weasyprint/tests/test_results
-/weasyprint/tests/w3_test_suite/test_results
 /.vagrant
-/docs/_build
+/.cache
+
+# Tests
+/.pytest_cache
+/weasyprint/tests/.cache
+/weasyprint/tests/test_draw/results

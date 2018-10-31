@@ -1,21 +1,20 @@
-# coding: utf8
 """
     weasyprint.float
     ----------------
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    Layout for floating boxes.
+
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
-
+from ..formatting_structure import boxes
 from .markers import list_marker_layout
 from .min_max import handle_min_max_width
 from .percentages import resolve_percentages, resolve_position_percentages
 from .preferred import shrink_to_fit
 from .tables import table_wrapper_width
-from ..formatting_structure import boxes
 
 
 @handle_min_max_width
@@ -26,15 +25,24 @@ def float_width(box, context, containing_block):
         box.width = shrink_to_fit(context, box, containing_block.width)
 
 
-def float_layout(context, box, containing_block, absolute_boxes, fixed_boxes):
+def float_layout(context, box, containing_block, device_size, absolute_boxes,
+                 fixed_boxes):
     """Set the width and position of floating ``box``."""
-    # avoid a circular imports
+    # Avoid circular imports
     from .blocks import block_container_layout
+    from .flex import flex_layout
     from .inlines import inline_replaced_box_width_height
 
-    resolve_percentages(box, (containing_block.width, containing_block.height))
-    resolve_position_percentages(
-        box, (containing_block.width, containing_block.height))
+    cb_width, cb_height = (containing_block.width, containing_block.height)
+    resolve_percentages(box, (cb_width, cb_height))
+
+    # TODO: This is only handled later in blocks.block_container_layout
+    # http://www.w3.org/TR/CSS21/visudet.html#normal-block
+    if cb_height == 'auto':
+        cb_height = (
+            containing_block.position_y - containing_block.content_box_y())
+
+    resolve_position_percentages(box, (cb_width, cb_height))
 
     if box.margin_left == 'auto':
         box.margin_left = 0
@@ -55,18 +63,23 @@ def float_layout(context, box, containing_block, absolute_boxes, fixed_boxes):
         float_width(box, context, containing_block)
 
     if box.is_table_wrapper:
-        table_wrapper_width(
-            context, box, (containing_block.width, containing_block.height))
+        table_wrapper_width(context, box, (cb_width, cb_height))
 
-    if isinstance(box, boxes.BlockBox):
+    if isinstance(box, boxes.BlockContainerBox):
         context.create_block_formatting_context()
         box, _, _, _, _ = block_container_layout(
             context, box, max_position_y=float('inf'),
-            skip_stack=None, device_size=None, page_is_empty=False,
+            skip_stack=None, device_size=device_size, page_is_empty=False,
             absolute_boxes=absolute_boxes, fixed_boxes=fixed_boxes,
             adjoining_margins=None)
         list_marker_layout(context, box)
         context.finish_block_formatting_context(box)
+    elif isinstance(box, boxes.FlexContainerBox):
+        box, _, _, _, _ = flex_layout(
+            context, box, max_position_y=float('inf'),
+            skip_stack=None, containing_block=containing_block,
+            device_size=device_size, page_is_empty=False,
+            absolute_boxes=absolute_boxes, fixed_boxes=fixed_boxes)
     else:
         assert isinstance(box, boxes.BlockReplacedBox)
 
@@ -79,7 +92,7 @@ def float_layout(context, box, containing_block, absolute_boxes, fixed_boxes):
 
 def find_float_position(context, box, containing_block):
     """Get the right position of the float ``box``."""
-    # See http://www.w3.org/TR/CSS2/visuren.html#dis-pos-flo
+    # See http://www.w3.org/TR/CSS2/visuren.html#float-position
 
     # Point 4 is already handled as box.position_y is set according to the
     # containing box top position, with collapsing margins handled
@@ -97,7 +110,7 @@ def find_float_position(context, box, containing_block):
     # Point 9
     # position_y is set now, let's define position_x
     # for float: left elements, it's already done!
-    if box.style.float == 'right':
+    if box.style['float'] == 'right':
         position_x += available_width - box.margin_width()
 
     box.translate(position_x - box.position_x, position_y - box.position_y)
@@ -111,7 +124,7 @@ def get_clearance(context, box, collapsed_margin=0):
     hypothetical_position = box.position_y + collapsed_margin
     # Hypothetical position is the position of the top border edge
     for excluded_shape in context.excluded_shapes:
-        if box.style.clear in (excluded_shape.style.float, 'both'):
+        if box.style['clear'] in (excluded_shape.style['float'], 'both'):
             y, h = excluded_shape.position_y, excluded_shape.margin_height()
             if hypothetical_position < y + h:
                 clearance = max(
@@ -130,24 +143,27 @@ def avoid_collisions(context, box, containing_block, outer=True):
         return 0, 0, containing_block.width
 
     while True:
-        colliding_shapes = [
-            shape for shape in excluded_shapes
-            if (shape.position_y < position_y <
-                shape.position_y + shape.margin_height())
-            or (shape.position_y < position_y + box_height <
-                shape.position_y + shape.margin_height())
-            or (shape.position_y >= position_y and
-                shape.position_y + shape.margin_height() <=
-                position_y + box_height)
-        ]
+        colliding_shapes = []
+        for shape in excluded_shapes:
+            # Assign locals to avoid slow attribute lookups.
+            shape_position_y = shape.position_y
+            shape_margin_height = shape.margin_height()
+            if ((shape_position_y < position_y <
+                 shape_position_y + shape_margin_height) or
+                (shape_position_y < position_y + box_height <
+                 shape_position_y + shape_margin_height) or
+                (shape_position_y >= position_y and
+                 shape_position_y + shape_margin_height <=
+                 position_y + box_height)):
+                colliding_shapes.append(shape)
         left_bounds = [
             shape.position_x + shape.margin_width()
             for shape in colliding_shapes
-            if shape.style.float == 'left']
+            if shape.style['float'] == 'left']
         right_bounds = [
             shape.position_x
             for shape in colliding_shapes
-            if shape.style.float == 'right']
+            if shape.style['float'] == 'right']
 
         # Set the default maximum bounds
         max_left_bound = containing_block.content_box_x()

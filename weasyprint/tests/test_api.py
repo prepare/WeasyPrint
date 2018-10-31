@@ -1,77 +1,46 @@
-# coding: utf8
 """
     weasyprint.tests.test_api
     -------------------------
 
     Test the public API.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
-
-import os
-import io
-import sys
-import math
-import contextlib
-import threading
 import gzip
+import io
+import math
+import os
+import sys
+import unicodedata
 import zlib
+from pathlib import Path
+from urllib.parse import urljoin, uses_relative
 
-import lxml.html
-import lxml.etree
 import cairocffi as cairo
+import py
 import pytest
 
-from .testing_utils import (
-    resource_filename, assert_no_logs, capture_logs, TestHTML,
-    http_server, temp_directory)
-from .test_draw import image_to_pixels
-from ..compat import urljoin, urlencode, urlparse_uses_relative, iteritems
+from .. import CSS, HTML, __main__, default_url_fetcher
 from ..urls import path2url
-from .. import HTML, CSS, default_url_fetcher
-from .. import __main__
-from .. import navigator
-from ..document import _TaggedTuple
-
-
-CHDIR_LOCK = threading.Lock()
-
-
-@contextlib.contextmanager
-def chdir(path):
-    """Change the current directory in a context manager."""
-    with CHDIR_LOCK:
-        old_dir = os.getcwd()
-        try:
-            os.chdir(path)
-            yield
-        finally:
-            os.chdir(old_dir)
-
-
-def read_file(filename):
-    """Shortcut for reading a file."""
-    with open(filename, 'rb') as fd:
-        return fd.read()
-
-
-def write_file(filename, content):
-    """Shortcut for reading a file."""
-    with open(filename, 'wb') as fd:
-        fd.write(content)
+from .test_draw import B, _, assert_pixels_equal, image_to_pixels, r
+from .testing_utils import (
+    FakeHTML, assert_no_logs, capture_logs, http_server, resource_filename)
 
 
 def _test_resource(class_, basename, check, **kwargs):
     """Common code for testing the HTML and CSS classes."""
     absolute_filename = resource_filename(basename)
+    absolute_path = Path(absolute_filename)
     url = path2url(absolute_filename)
     check(class_(absolute_filename, **kwargs))
+    check(class_(absolute_path, **kwargs))
     check(class_(guess=absolute_filename, **kwargs))
+    check(class_(guess=absolute_path, **kwargs))
     check(class_(filename=absolute_filename, **kwargs))
+    check(class_(filename=absolute_path, **kwargs))
     check(class_(url, **kwargs))
     check(class_(guess=url, **kwargs))
     check(class_(url=url, **kwargs))
@@ -83,48 +52,102 @@ def _test_resource(class_, basename, check, **kwargs):
         check(class_(file_obj=fd, **kwargs))
     with open(absolute_filename, 'rb') as fd:
         content = fd.read()
-    with chdir(os.path.dirname(__file__)):
-        relative_filename = os.path.join('resources', basename)
-        check(class_(relative_filename, **kwargs))
-        check(class_(string=content, base_url=relative_filename, **kwargs))
-        encoding = kwargs.get('encoding') or 'utf8'
-        check(class_(string=content.decode(encoding),  # unicode
-                     base_url=relative_filename, **kwargs))
+    py.path.local(os.path.dirname(__file__)).chdir()
+    relative_filename = os.path.join('resources', basename)
+    relative_path = Path(relative_filename)
+    check(class_(relative_filename, **kwargs))
+    check(class_(relative_path, **kwargs))
+    check(class_(string=content, base_url=relative_filename, **kwargs))
+    encoding = kwargs.get('encoding') or 'utf8'
+    check(class_(string=content.decode(encoding),  # unicode
+                 base_url=relative_filename, **kwargs))
     with pytest.raises(TypeError):
         class_(filename='foo', url='bar')
+
+
+def _check_doc1(html, has_base_url=True):
+    """Check that a parsed HTML document looks like resources/doc1.html"""
+    root = html.etree_element
+    assert root.tag == 'html'
+    assert [child.tag for child in root] == ['head', 'body']
+    _head, body = root
+    assert [child.tag for child in body] == ['h1', 'p', 'ul', 'div']
+    h1, p, ul, div = body
+    assert h1.text == 'WeasyPrint test document (with Ünicōde)'
+    if has_base_url:
+        url = urljoin(html.base_url, 'pattern.png')
+        assert url.startswith('file:')
+        assert url.endswith('weasyprint/tests/resources/pattern.png')
+    else:
+        assert html.base_url is None
+
+
+def _run(args, stdin=b''):
+    stdin = io.BytesIO(stdin)
+    stdout = io.BytesIO()
+    try:
+        __main__.HTML = FakeHTML
+        __main__.main(args.split(), stdin=stdin, stdout=stdout)
+    finally:
+        __main__.HTML = HTML
+    return stdout.getvalue()
+
+
+class _fake_file(object):
+    def __init__(self):
+        self.chunks = []
+
+    def write(self, data):
+        self.chunks.append(bytes(data[:]))
+
+    def getvalue(self):
+        return b''.join(self.chunks)
+
+
+def _png_size(result):
+    png_bytes, width, height = result
+    surface = cairo.ImageSurface.create_from_png(io.BytesIO(png_bytes))
+    assert (surface.get_width(), surface.get_height()) == (width, height)
+    return width, height
+
+
+def _round_meta(pages):
+    """Eliminate errors of floating point arithmetic for metadata.
+    (eg. 49.99999999999994 instead of 50)
+
+    """
+    for page in pages:
+        anchors = page.anchors
+        for anchor_name, (pos_x, pos_y) in anchors.items():
+            anchors[anchor_name] = round(pos_x, 6), round(pos_y, 6)
+        links = page.links
+        for i, link in enumerate(links):
+            link_type, target, (pos_x, pos_y, width, height) = link
+            link = (
+                link_type, target, (round(pos_x, 6), round(pos_y, 6),
+                                    round(width, 6), round(height, 6)))
+            links[i] = link
+        bookmarks = page.bookmarks
+        for i, (level, label, (pos_x, pos_y)) in enumerate(bookmarks):
+            bookmarks[i] = level, label, (round(pos_x, 6), round(pos_y, 6))
 
 
 @assert_no_logs
 def test_html_parsing():
     """Test the constructor for the HTML class."""
-    def check_doc1(html, has_base_url=True):
-        """Check that a parsed HTML document looks like resources/doc1.html"""
-        assert html.root_element.tag == 'html'
-        assert [child.tag for child in html.root_element] == ['head', 'body']
-        _head, body = html.root_element
-        assert [child.tag for child in body] == ['h1', 'p', 'ul']
-        h1 = body[0]
-        assert h1.text == 'WeasyPrint test document (with Ünicōde)'
-        if has_base_url:
-            url = urljoin(html.base_url, 'pattern.png')
-            assert url.startswith('file:')
-            assert url.endswith('weasyprint/tests/resources/pattern.png')
-        else:
-            assert html.base_url is None
-
-    _test_resource(TestHTML, 'doc1.html', check_doc1)
-    _test_resource(TestHTML, 'doc1_UTF-16BE.html', check_doc1,
+    _test_resource(FakeHTML, 'doc1.html', _check_doc1)
+    _test_resource(FakeHTML, 'doc1_UTF-16BE.html', _check_doc1,
                    encoding='UTF-16BE')
 
-    with chdir(os.path.dirname(__file__)):
-        filename = os.path.join('resources', 'doc1.html')
-        tree = lxml.html.parse(filename)
-        check_doc1(TestHTML(tree=tree, base_url=filename))
-        check_doc1(TestHTML(tree=tree), has_base_url=False)
-        head, _body = tree.getroot()
-        assert head.tag == 'head'
-        lxml.etree.SubElement(head, 'base', href='resources/')
-        check_doc1(TestHTML(tree=tree, base_url='.'))
+    py.path.local(os.path.dirname(__file__)).chdir()
+    filename = os.path.join('resources', 'doc1.html')
+    with open(filename, encoding='utf-8') as fd:
+        string = fd.read()
+    _check_doc1(FakeHTML(string=string, base_url=filename))
+    _check_doc1(FakeHTML(string=string), has_base_url=False)
+    string_with_meta = string.replace(
+        '<meta', '<base href="resources/"><meta')
+    _check_doc1(FakeHTML(string=string_with_meta, base_url='.'))
 
 
 @assert_no_logs
@@ -133,81 +156,75 @@ def test_css_parsing():
     def check_css(css):
         """Check that a parsed stylsheet looks like resources/utf8-test.css"""
         # Using 'encoding' adds a CSSCharsetRule
-        rule = css.stylesheet.rules[-1]
-        assert rule.selector.as_css() == 'h1::before'
-        content, background = rule.declarations
-
-        assert content.name == 'content'
-        string, = content.value
-        assert string.value == 'I løvë Unicode'
-
-        assert background.name == 'background-image'
-        url_value, = background.value
-        assert url_value.type == 'URI'
-        url = urljoin(css.base_url, url_value.value)
-        assert url.startswith('file:')
-        assert url.endswith('weasyprint/tests/resources/pattern.png')
+        h1_rule, = css.matcher.lower_local_name_selectors['h1']
+        assert h1_rule[3] == 'before'
+        assert h1_rule[4][0][0] == 'content'
+        assert h1_rule[4][0][1][0][1] == 'I løvë Unicode'
+        assert h1_rule[4][1][0] == 'background_image'
+        assert h1_rule[4][1][1][0][0] == 'url'
+        assert h1_rule[4][1][1][0][1].startswith('file:')
+        assert h1_rule[4][1][1][0][1].endswith(
+            'weasyprint/tests/resources/pattern.png')
 
     _test_resource(CSS, 'utf8-test.css', check_css)
     _test_resource(CSS, 'latin1-test.css', check_css, encoding='latin1')
 
 
 def check_png_pattern(png_bytes, x2=False, blank=False, rotated=False):
-    from .test_draw import _, r, B, assert_pixels_equal
     if blank:
         expected_pixels = [
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
         ]
         size = 8
     elif x2:
         expected_pixels = [
-            _+_+_+_+_+_+_+_+_+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_+_+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_+_+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_+_+_+_+_+_+_+_+_,
-            _+_+_+_+r+r+B+B+B+B+B+B+_+_+_+_,
-            _+_+_+_+r+r+B+B+B+B+B+B+_+_+_+_,
-            _+_+_+_+B+B+B+B+B+B+B+B+_+_+_+_,
-            _+_+_+_+B+B+B+B+B+B+B+B+_+_+_+_,
-            _+_+_+_+B+B+B+B+B+B+B+B+_+_+_+_,
-            _+_+_+_+B+B+B+B+B+B+B+B+_+_+_+_,
-            _+_+_+_+B+B+B+B+B+B+B+B+_+_+_+_,
-            _+_+_+_+B+B+B+B+B+B+B+B+_+_+_+_,
-            _+_+_+_+_+_+_+_+_+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_+_+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_+_+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_+_+_+_+_+_+_+_+_,
+            _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + r + r + B + B + B + B + B + B + _ + _ + _ + _,
+            _ + _ + _ + _ + r + r + B + B + B + B + B + B + _ + _ + _ + _,
+            _ + _ + _ + _ + B + B + B + B + B + B + B + B + _ + _ + _ + _,
+            _ + _ + _ + _ + B + B + B + B + B + B + B + B + _ + _ + _ + _,
+            _ + _ + _ + _ + B + B + B + B + B + B + B + B + _ + _ + _ + _,
+            _ + _ + _ + _ + B + B + B + B + B + B + B + B + _ + _ + _ + _,
+            _ + _ + _ + _ + B + B + B + B + B + B + B + B + _ + _ + _ + _,
+            _ + _ + _ + _ + B + B + B + B + B + B + B + B + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _ + _,
         ]
         size = 16
     elif rotated:
         expected_pixels = [
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+B+B+B+B+_+_,
-            _+_+B+B+B+B+_+_,
-            _+_+B+B+B+B+_+_,
-            _+_+r+B+B+B+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + B + B + B + B + _ + _,
+            _ + _ + B + B + B + B + _ + _,
+            _ + _ + B + B + B + B + _ + _,
+            _ + _ + r + B + B + B + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
         ]
         size = 8
     else:
         expected_pixels = [
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+r+B+B+B+_+_,
-            _+_+B+B+B+B+_+_,
-            _+_+B+B+B+B+_+_,
-            _+_+B+B+B+B+_+_,
-            _+_+_+_+_+_+_+_,
-            _+_+_+_+_+_+_+_,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + r + B + B + B + _ + _,
+            _ + _ + B + B + B + B + _ + _,
+            _ + _ + B + B + B + B + _ + _,
+            _ + _ + B + B + B + B + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
+            _ + _ + _ + _ + _ + _ + _ + _,
         ]
         size = 8
     surface = cairo.ImageSurface.create_from_png(io.BytesIO(png_bytes))
@@ -217,60 +234,49 @@ def check_png_pattern(png_bytes, x2=False, blank=False, rotated=False):
 
 
 @assert_no_logs
-def test_python_render():
+def test_python_render(tmpdir):
     """Test rendering with the Python API."""
     base_url = resource_filename('dummy.html')
     html_string = '<body><img src=pattern.png>'
     css_string = '''
         @page { margin: 2px; size: 8px; background: #fff }
         body { margin: 0; font-size: 0 }
-        img { image-rendering: optimizeSpeed }
+        img { image-rendering: pixelated }
 
         @media screen { img { transform: rotate(-90deg) } }
     '''
-    html = TestHTML(string=html_string, base_url=base_url)
+    html = FakeHTML(string=html_string, base_url=base_url)
     css = CSS(string=css_string)
 
     png_bytes = html.write_png(stylesheets=[css])
     pdf_bytes = html.write_pdf(stylesheets=[css])
     assert png_bytes.startswith(b'\211PNG\r\n\032\n')
     assert pdf_bytes.startswith(b'%PDF')
-
     check_png_pattern(png_bytes)
     # TODO: check PDF content? How?
 
-    class fake_file(object):
-        def __init__(self):
-            self.chunks = []
-
-        def write(self, data):
-            self.chunks.append(bytes(data[:]))
-
-        def getvalue(self):
-            return b''.join(self.chunks)
-    png_file = fake_file()
+    png_file = _fake_file()
     html.write_png(png_file, stylesheets=[css])
     assert png_file.getvalue() == png_bytes
-    pdf_file = fake_file()
+    pdf_file = _fake_file()
     html.write_pdf(pdf_file, stylesheets=[css])
-    assert pdf_file.getvalue() == pdf_bytes
+    # assert pdf_file.read_binary() == pdf_bytes
 
-    with temp_directory() as temp:
-        png_filename = os.path.join(temp, '1.png')
-        pdf_filename = os.path.join(temp, '1.pdf')
-        html.write_png(png_filename, stylesheets=[css])
-        html.write_pdf(pdf_filename, stylesheets=[css])
-        assert read_file(png_filename) == png_bytes
-        assert read_file(pdf_filename) == pdf_bytes
+    png_file = tmpdir.join('1.png')
+    pdf_file = tmpdir.join('1.pdf')
+    html.write_png(png_file.strpath, stylesheets=[css])
+    html.write_pdf(pdf_file.strpath, stylesheets=[css])
+    assert png_file.read_binary() == png_bytes
+    # assert pdf_file.read_binary() == pdf_bytes
 
-        png_filename = os.path.join(temp, '2.png')
-        pdf_filename = os.path.join(temp, '2.pdf')
-        with open(png_filename, 'wb') as png_file:
-            html.write_png(png_file, stylesheets=[css])
-        with open(pdf_filename, 'wb') as pdf_file:
-            html.write_pdf(pdf_file, stylesheets=[css])
-        assert read_file(png_filename) == png_bytes
-        assert read_file(pdf_filename) == pdf_bytes
+    png_file = tmpdir.join('2.png')
+    pdf_file = tmpdir.join('2.pdf')
+    with open(png_file.strpath, 'wb') as png_fd:
+        html.write_png(png_fd, stylesheets=[css])
+    with open(pdf_file.strpath, 'wb') as pdf_fd:
+        html.write_pdf(pdf_fd, stylesheets=[css])
+    assert png_file.read_binary() == png_bytes
+    # assert pdf_file.read_binary() == pdf_bytes
 
     x2_png_bytes = html.write_png(stylesheets=[css], resolution=192)
     check_png_pattern(x2_png_bytes, x2=True)
@@ -279,20 +285,19 @@ def test_python_render():
     rotated_png_bytes = html.write_png(stylesheets=[screen_css])
     check_png_pattern(rotated_png_bytes, rotated=True)
 
-    assert TestHTML(
+    assert FakeHTML(
         string=html_string, base_url=base_url, media_type='screen'
     ).write_png(
         stylesheets=[io.BytesIO(css_string.encode('utf8'))]
     ) == rotated_png_bytes
-    assert TestHTML(
+    assert FakeHTML(
         string='<style>%s</style>%s' % (css_string, html_string),
         base_url=base_url, media_type='screen'
     ).write_png() == rotated_png_bytes
 
 
 @assert_no_logs
-def test_command_line_render():
-    """Test rendering with the command-line API."""
+def test_command_line_render(tmpdir):
     css = b'''
         @page { margin: 2px; size: 8px; background: #fff }
         @media screen { img { transform: rotate(-90deg) } }
@@ -302,107 +307,103 @@ def test_command_line_render():
     combined = b'<style>' + css + b'</style>' + html
     linked = b'<link rel=stylesheet href=style.css>' + html
 
-    with chdir(resource_filename('')):
-        # Reference
-        html_obj = TestHTML(string=combined, base_url='dummy.html')
-        pdf_bytes = html_obj.write_pdf()
-        png_bytes = html_obj.write_png()
-        x2_png_bytes = html_obj.write_png(resolution=192)
-        rotated_png_bytes = TestHTML(string=combined, base_url='dummy.html',
-                                     media_type='screen').write_png()
-        empty_png_bytes = TestHTML(
-            string=b'<style>' + css + b'</style>').write_png()
+    py.path.local(resource_filename('')).chdir()
+    # Reference
+    html_obj = FakeHTML(string=combined, base_url='dummy.html')
+    # pdf_bytes = html_obj.write_pdf()
+    png_bytes = html_obj.write_png()
+    x2_png_bytes = html_obj.write_png(resolution=192)
+    rotated_png_bytes = FakeHTML(string=combined, base_url='dummy.html',
+                                 media_type='screen').write_png()
+    empty_png_bytes = FakeHTML(
+        string=b'<style>' + css + b'</style>').write_png()
     check_png_pattern(png_bytes)
     check_png_pattern(rotated_png_bytes, rotated=True)
     check_png_pattern(empty_png_bytes, blank=True)
 
-    def run(args, stdin=b''):
-        stdin = io.BytesIO(stdin)
-        stdout = io.BytesIO()
-        try:
-            __main__.HTML = TestHTML
-            __main__.main(args.split(), stdin=stdin, stdout=stdout)
-        finally:
-            __main__.HTML = HTML
-        return stdout.getvalue()
+    tmpdir.chdir()
+    with open(resource_filename('pattern.png'), 'rb') as pattern_fd:
+        pattern_bytes = pattern_fd.read()
+    tmpdir.join('pattern.png').write_binary(pattern_bytes)
+    tmpdir.join('no_css.html').write_binary(html)
+    tmpdir.join('combined.html').write_binary(combined)
+    tmpdir.join('combined-UTF-16BE.html').write_binary(
+        combined.decode('ascii').encode('UTF-16BE'))
+    tmpdir.join('linked.html').write_binary(linked)
+    tmpdir.join('style.css').write_binary(css)
 
-    with temp_directory() as temp:
-        with chdir(temp):
-            pattern_bytes = read_file(resource_filename('pattern.png'))
-            write_file('pattern.png', pattern_bytes)
-            write_file('no_css.html', html)
-            write_file('combined.html', combined)
-            write_file('combined-UTF-16BE.html',
-                       combined.decode('ascii').encode('UTF-16BE'))
-            write_file('linked.html', linked)
-            write_file('style.css', css)
+    _run('combined.html out1.png')
+    _run('combined.html out2.pdf')
+    assert tmpdir.join('out1.png').read_binary() == png_bytes
+    # TODO: check PDF content? How?
+    # assert tmpdir.join('out2.pdf').read_binary() == pdf_bytes
 
-            run('combined.html out1.png')
-            run('combined.html out2.pdf')
-            assert read_file('out1.png') == png_bytes
-            assert read_file('out2.pdf') == pdf_bytes
+    _run('combined-UTF-16BE.html out3.png --encoding UTF-16BE')
+    assert tmpdir.join('out3.png').read_binary() == png_bytes
 
-            run('combined-UTF-16BE.html out3.png --encoding UTF-16BE')
-            assert read_file('out3.png') == png_bytes
+    _run(tmpdir.join('combined.html').strpath + ' out4.png')
+    assert tmpdir.join('out4.png').read_binary() == png_bytes
 
-            combined_absolute = os.path.join(temp, 'combined.html')
-            run(combined_absolute + ' out4.png')
-            assert read_file('out4.png') == png_bytes
+    _run(path2url(tmpdir.join('combined.html').strpath) + ' out5.png')
+    assert tmpdir.join('out5.png').read_binary() == png_bytes
 
-            combined_url = path2url(os.path.join(temp, 'combined.html'))
-            run(combined_url + ' out5.png')
-            assert read_file('out5.png') == png_bytes
+    _run('linked.html out6.png')  # test relative URLs
+    assert tmpdir.join('out6.png').read_binary() == png_bytes
 
-            run('linked.html out6.png')  # test relative URLs
-            assert read_file('out6.png') == png_bytes
+    _run('combined.html out7 -f png')
+    _run('combined.html out8 --format pdf')
+    assert tmpdir.join('out7').read_binary() == png_bytes
+    # assert tmpdir.join('out8').read_binary(), pdf_bytes
 
-            run('combined.html out7 -f png')
-            run('combined.html out8 --format pdf')
-            assert read_file('out7') == png_bytes
-            assert read_file('out8') == pdf_bytes
+    _run('no_css.html out9.png')
+    _run('no_css.html out10.png -s style.css')
+    assert tmpdir.join('out9.png').read_binary() != png_bytes
+    # assert tmpdir.join('out10.png').read_binary() == png_bytes
 
-            run('no_css.html out9.png')
-            run('no_css.html out10.png -s style.css')
-            assert read_file('out9.png') != png_bytes
-            assert read_file('out10.png') == png_bytes
+    stdout = _run('--format png combined.html -')
+    assert stdout == png_bytes
 
-            stdout = run('--format png combined.html -')
-            assert stdout == png_bytes
+    _run('- out11.png', stdin=combined)
+    check_png_pattern(tmpdir.join('out11.png').read_binary())
+    assert tmpdir.join('out11.png').read_binary() == png_bytes
 
-            run('- out11.png', stdin=combined)
-            check_png_pattern(read_file('out11.png'))
-            assert read_file('out11.png') == png_bytes
+    stdout = _run('--format png - -', stdin=combined)
+    assert stdout == png_bytes
 
-            stdout = run('--format png - -', stdin=combined)
-            assert stdout == png_bytes
+    _run('combined.html out13.png --media-type screen')
+    _run('combined.html out12.png -m screen')
+    _run('linked.html out14.png -m screen')
+    assert tmpdir.join('out12.png').read_binary() == rotated_png_bytes
+    assert tmpdir.join('out13.png').read_binary() == rotated_png_bytes
+    assert tmpdir.join('out14.png').read_binary() == rotated_png_bytes
 
-            run('combined.html out13.png --media-type screen')
-            run('combined.html out12.png -m screen')
-            run('linked.html out14.png -m screen')
-            assert read_file('out12.png') == rotated_png_bytes
-            assert read_file('out13.png') == rotated_png_bytes
-            assert read_file('out14.png') == rotated_png_bytes
+    stdout = _run('-f pdf combined.html -')
+    assert stdout.count(b'attachment') == 0
+    stdout = _run('-f pdf -a pattern.png combined.html -')
+    assert stdout.count(b'attachment') == 1
+    stdout = _run('-f pdf -a style.css -a pattern.png combined.html -')
+    assert stdout.count(b'attachment') == 2
 
-            stdout = run('-f png -r 192 linked.html -')
-            assert stdout == x2_png_bytes
-            stdout = run('-f png --resolution 192 linked.html -')
-            assert run('linked.html - -f png --resolution 192') == x2_png_bytes
-            assert stdout == x2_png_bytes
+    stdout = _run('-f png -r 192 linked.html -')
+    assert stdout == x2_png_bytes
+    stdout = _run('-f png --resolution 192 linked.html -')
+    assert _run('linked.html - -f png --resolution 192') == x2_png_bytes
+    assert stdout == x2_png_bytes
 
-            os.mkdir('subdirectory')
-            os.chdir('subdirectory')
-            with capture_logs() as logs:
-                stdout = run('--format png - -', stdin=combined)
-            assert len(logs) == 1
-            assert logs[0].startswith('WARNING: Failed to load image')
-            assert stdout == empty_png_bytes
+    os.mkdir('subdirectory')
+    py.path.local('subdirectory').chdir()
+    with capture_logs() as logs:
+        stdout = _run('--format png - -', stdin=combined)
+    assert len(logs) == 1
+    assert logs[0].startswith('ERROR: Failed to load image')
+    assert stdout == empty_png_bytes
 
-            stdout = run('--format png --base-url .. - -', stdin=combined)
-            assert stdout == png_bytes
+    stdout = _run('--format png --base-url .. - -', stdin=combined)
+    assert stdout == png_bytes
 
 
 @assert_no_logs
-def test_unicode_filenames():
+def test_unicode_filenames(tmpdir):
     """Test non-ASCII filenames both in Unicode or bytes form."""
     # Replicate pattern.png in CSS so that base_url does not matter.
     html = b'''
@@ -413,39 +414,30 @@ def test_unicode_filenames():
         </style>
         <body>
     '''
-    png_bytes = TestHTML(string=html).write_png()
+    png_bytes = FakeHTML(string=html).write_png()
     check_png_pattern(png_bytes)
-    # Remember we have __future__.unicode_literals
     unicode_filename = 'Unicödé'
-    with temp_directory() as temp:
-        with chdir(temp):
-            write_file(unicode_filename, html)
-            assert os.listdir('.') == [unicode_filename]
-            # This should be independent of the encoding used by the filesystem
-            bytes_filename, = os.listdir(b'.')
+    if sys.platform.startswith('darwin'):
+        unicode_filename = unicodedata.normalize('NFD', unicode_filename)
 
-            assert TestHTML(unicode_filename).write_png() == png_bytes
-            assert TestHTML(bytes_filename).write_png() == png_bytes
+    tmpdir.chdir()
+    tmpdir.join(unicode_filename).write(html)
+    bytes_file, = tmpdir.listdir()
+    assert bytes_file.basename == unicode_filename
 
-            os.remove(unicode_filename)
-            assert os.listdir('.') == []
+    assert FakeHTML(unicode_filename).write_png() == png_bytes
+    assert FakeHTML(bytes_file.strpath).write_png() == png_bytes
 
-            TestHTML(string=html).write_png(unicode_filename)
-            assert read_file(bytes_filename) == png_bytes
+    os.remove(unicode_filename)
+    assert tmpdir.listdir() == []
 
-            # Surface.write_to_png does not accept bytes filenames
-            # on Python 3
-            if sys.version_info[0] < 3:
-                os.remove(unicode_filename)
-                assert os.listdir('.') == []
-
-                TestHTML(string=html).write_png(bytes_filename)
-                assert read_file(unicode_filename) == png_bytes
+    FakeHTML(string=html).write_png(unicode_filename)
+    assert bytes_file.read_binary() == png_bytes
 
 
 @assert_no_logs
 def test_low_level_api():
-    html = TestHTML(string='<body>')
+    html = FakeHTML(string='<body>')
     css = CSS(string='''
         @page { margin: 2px; size: 8px; background: #fff }
         html { background: #00f; }
@@ -453,7 +445,8 @@ def test_low_level_api():
     ''')
     pdf_bytes = html.write_pdf(stylesheets=[css])
     assert pdf_bytes.startswith(b'%PDF')
-    assert html.render([css]).write_pdf() == pdf_bytes
+    # TODO: check PDF content? How?
+    # assert html.render([css]).write_pdf() == pdf_bytes
 
     png_bytes = html.write_png(stylesheets=[css])
     document = html.render([css], enable_hinting=True)
@@ -487,19 +480,13 @@ def test_low_level_api():
     assert (width, height) == (16, 16)
     check_png_pattern(png_bytes, x2=True)
 
-    def png_size(result):
-        png_bytes, width, height = result
-        surface = cairo.ImageSurface.create_from_png(io.BytesIO(png_bytes))
-        assert (surface.get_width(), surface.get_height()) == (width, height)
-        return width, height
-
     document = html.render([css], enable_hinting=True)
     page, = document.pages
     assert (page.width, page.height) == (8, 8)
     # A resolution that is not multiple of 96:
-    assert png_size(document.write_png(resolution=145.2)) == (13, 13)
+    assert _png_size(document.write_png(resolution=145.2)) == (13, 13)
 
-    document = TestHTML(string='''
+    document = FakeHTML(string='''
         <style>
             @page:first { size: 5px 10px } @page { size: 6px 4px }
             p { page-break-before: always }
@@ -513,41 +500,18 @@ def test_low_level_api():
 
     result = document.write_png()
     # (Max of both widths, Sum of both heights)
-    assert png_size(result) == (6, 14)
+    assert _png_size(result) == (6, 14)
     assert document.copy([page_1, page_2]).write_png() == result
-    assert png_size(document.copy([page_1]).write_png()) == (5, 10)
-    assert png_size(document.copy([page_2]).write_png()) == (6, 4)
-
-
-def round_meta(pages):
-    """Eliminate errors of floating point arithmetic for metadata.
-    (eg. 49.99999999999994 instead of 50)
-
-    """
-    for page in pages:
-        anchors = page.anchors
-        for anchor_name, (pos_x, pos_y) in iteritems(anchors):
-            anchors[anchor_name] = round(pos_x, 6), round(pos_y, 6)
-        links = page.links
-        for i, link in enumerate(links):
-            sourceline = link.sourceline
-            link_type, target, (pos_x, pos_y, width, height) = link
-            link = _TaggedTuple((
-                link_type, target, (round(pos_x, 6), round(pos_y, 6),
-                                    round(width, 6), round(height, 6))))
-            link.sourceline = sourceline
-            links[i] = link
-        bookmarks = page.bookmarks
-        for i, (level, label, (pos_x, pos_y)) in enumerate(bookmarks):
-            bookmarks[i] = level, label, (round(pos_x, 6), round(pos_y, 6))
+    assert _png_size(document.copy([page_1]).write_png()) == (5, 10)
+    assert _png_size(document.copy([page_2]).write_png()) == (6, 4)
 
 
 @assert_no_logs
 def test_bookmarks():
     def assert_bookmarks(html, expected_by_page, expected_tree, round=False):
-        document = TestHTML(string=html).render()
+        document = FakeHTML(string=html).render()
         if round:
-            round_meta(document.pages)
+            _round_meta(document.pages)
         assert [p.bookmarks for p in document.pages] == expected_by_page
         assert document.make_bookmark_tree() == expected_tree
     assert_bookmarks('''
@@ -684,9 +648,9 @@ def test_links():
                      base_url=resource_filename('<inline HTML>'),
                      warnings=(), round=False):
         with capture_logs() as logs:
-            document = TestHTML(string=html, base_url=base_url).render()
+            document = FakeHTML(string=html, base_url=base_url).render()
             if round:
-                round_meta(document.pages)
+                _round_meta(document.pages)
             resolved_links = list(document.resolve_links())
         assert len(logs) == len(warnings)
         for message, expected in zip(logs, warnings):
@@ -722,13 +686,20 @@ def test_links():
         {'hello': (0, 200)},
         {'lipsum': (0, 0)}
     ], [
-        [
-            ('external', 'http://weasyprint.org', (0, 0, 30, 20)),
-            ('external', 'http://weasyprint.org', (0, 0, 30, 30)),
-            ('internal', (1, 0, 0), (10, 100, 32, 20)),
-            ('internal', (1, 0, 0), (10, 100, 32, 32))
-        ],
-        [('internal', (0, 0, 200), (0, 0, 200, 30))],
+        (
+            [
+                ('external', 'http://weasyprint.org', (0, 0, 30, 20)),
+                ('external', 'http://weasyprint.org', (0, 0, 30, 30)),
+                ('internal', 'lipsum', (10, 100, 32, 20)),
+                ('internal', 'lipsum', (10, 100, 32, 32))
+            ],
+            [('hello', 0, 200)],
+        ),
+        (
+            [
+                ('internal', 'hello', (0, 0, 200, 30))
+            ],
+            [('lipsum', 0, 0)]),
     ])
 
     assert_links(
@@ -737,8 +708,8 @@ def test_links():
             <a href="../lipsum/é_%E9" style="display: block; margin: 10px 5px">
         ''', [[('external', 'http://weasyprint.org/foo/lipsum/%C3%A9_%E9',
                 (5, 10, 190, 0))]],
-        [{}], [[('external', 'http://weasyprint.org/foo/lipsum/%C3%A9_%E9',
-                 (5, 10, 190, 0))]],
+        [{}], [([('external', 'http://weasyprint.org/foo/lipsum/%C3%A9_%E9',
+                  (5, 10, 190, 0))], [])],
         base_url='http://weasyprint.org/foo/bar/')
     assert_links(
         '''
@@ -747,20 +718,27 @@ def test_links():
                         -weasy-link: url(../lipsum/é_%E9)">
         ''', [[('external', 'http://weasyprint.org/foo/lipsum/%C3%A9_%E9',
                 (5, 10, 190, 0))]],
-        [{}], [[('external', 'http://weasyprint.org/foo/lipsum/%C3%A9_%E9',
-                 (5, 10, 190, 0))]],
+        [{}], [([('external', 'http://weasyprint.org/foo/lipsum/%C3%A9_%E9',
+                  (5, 10, 190, 0))], [])],
         base_url='http://weasyprint.org/foo/bar/')
 
-    # Relative URI reference without a base URI: not allowed
+    # Relative URI reference without a base URI: allowed for links
     assert_links(
-        '<a href="../lipsum">',
-        [[]], [{}], [[]], base_url=None, warnings=[
-            'WARNING: Relative URI reference without a base URI'])
+        '''
+            <body style="width: 200px">
+            <a href="../lipsum" style="display: block; margin: 10px 5px">
+        ''', [[('external', '../lipsum', (5, 10, 190, 0))]], [{}],
+        [([('external', '../lipsum', (5, 10, 190, 0))], [])], base_url=None)
+
+    # Relative URI reference without a base URI: not supported for -weasy-link
     assert_links(
-        '<div style="-weasy-link: url(../lipsum)">',
-        [[]], [{}], [[]], base_url=None, warnings=[
-            "WARNING: Ignored `-weasy-link: url(../lipsum)` at 1:1, "
-            "Relative URI reference without a base URI: '../lipsum'."])
+        '''
+            <body style="width: 200px">
+            <div style="-weasy-link: url(../lipsum);
+                        display: block; margin: 10px 5px">
+        ''', [[]], [{}], [([], [])], base_url=None, warnings=[
+            'WARNING: Ignored `-weasy-link: url("../lipsum")` at 1:1, '
+            'Relative URI reference without a base URI'])
 
     # Internal or absolute URI reference without a base URI: OK
     assert_links(
@@ -772,8 +750,9 @@ def test_links():
         ''', [[('internal', 'lipsum', (5, 10, 190, 0)),
                ('external', 'http://weasyprint.org/', (0, 10, 200, 0))]],
         [{'lipsum': (5, 10)}],
-        [[('internal', (0, 5, 10), (5, 10, 190, 0)),
-          ('external', 'http://weasyprint.org/', (0, 10, 200, 0))]],
+        [([('internal', 'lipsum', (5, 10, 190, 0)),
+           ('external', 'http://weasyprint.org/', (0, 10, 200, 0))],
+          [('lipsum', 5, 10)])],
         base_url=None)
 
     assert_links(
@@ -784,7 +763,7 @@ def test_links():
         ''',
         [[('internal', 'lipsum', (5, 10, 190, 0))]],
         [{'lipsum': (5, 10)}],
-        [[('internal', (0, 5, 10), (5, 10, 190, 0))]],
+        [([('internal', 'lipsum', (5, 10, 190, 0))], [('lipsum', 5, 10)])],
         base_url=None)
 
     assert_links(
@@ -797,10 +776,10 @@ def test_links():
         [[('internal', 'lipsum', (0, 0, 200, 15)),
           ('internal', 'missing', (0, 15, 200, 15))]],
         [{'lipsum': (0, 15)}],
-        [[('internal', (0, 0, 15), (0, 0, 200, 15))]],
+        [([('internal', 'lipsum', (0, 0, 200, 15))], [('lipsum', 0, 15)])],
         base_url=None,
         warnings=[
-            'WARNING: No anchor #missing for internal URI reference'])
+            'ERROR: No anchor #missing for internal URI reference'])
 
     assert_links(
         '''
@@ -810,80 +789,19 @@ def test_links():
         ''',
         [[('internal', 'lipsum', (30, 10, 40, 200))]],
         [{'lipsum': (70, 10)}],
-        [[('internal', (0, 70, 10), (30, 10, 40, 200))]],
+        [([('internal', 'lipsum', (30, 10, 40, 200))], [('lipsum', 70, 10)])],
         round=True)
 
 
-def wsgi_client(path_info, qs_args=None):
-    start_response_calls = []
-
-    def start_response(status, headers):
-        start_response_calls.append((status, headers))
-    environ = {'PATH_INFO': path_info,
-               'QUERY_STRING': urlencode(qs_args or {})}
-    response = b''.join(navigator.app(environ, start_response))
-    assert len(start_response_calls) == 1
-    status, headers = start_response_calls[0]
-    return status, dict(headers), response
-
-
-@assert_no_logs
-def test_navigator():
-    with temp_directory() as temp:
-        status, headers, body = wsgi_client('/favicon.ico')
-        assert status == '200 OK'
-        assert headers['Content-Type'] == 'image/x-icon'
-        assert body == read_file(navigator.FAVICON)
-
-        status, headers, body = wsgi_client('/lipsum')
-        assert status == '404 Not Found'
-
-        status, headers, body = wsgi_client('/')
-        body = body.decode('utf8')
-        assert status == '200 OK'
-        assert headers['Content-Type'].startswith('text/html;')
-        assert '<title>WeasyPrint Navigator</title>' in body
-        assert '<img' not in body
-        assert '></a>' not in body
-
-        filename = os.path.join(temp, 'test.html')
-        write_file(filename, b'''
-            <h1 id=foo><a href="http://weasyprint.org">Lorem ipsum</a></h1>
-            <h2><a href="#foo">bar</a></h2>
-        ''')
-
-        url = path2url(filename)
-        for status, headers, body in [
-            wsgi_client('/view/' + url),
-            wsgi_client('/', {'url': url}),
-        ]:
-            body = body.decode('utf8')
-            assert status == '200 OK'
-            assert headers['Content-Type'].startswith('text/html;')
-            assert '<title>WeasyPrint Navigator</title>' in body
-            assert '<img src="data:image/png;base64,' in body
-            assert ' name="foo"></a>' in body
-            assert ' href="#foo"></a>' in body
-            assert ' href="/view/http://weasyprint.org"></a>' in body
-
-        status, headers, body = wsgi_client('/pdf/' + url)
-        assert status == '200 OK'
-        assert headers['Content-Type'] == 'application/pdf'
-        assert body.startswith(b'%PDF')
-        assert (b'/A << /Type /Action /S /URI /URI '
-                b'(http://weasyprint.org) >>') in body
-        lipsum = '\ufeffLorem ipsum'.encode('utf-16-be')
-        assert (b'<< /Title (' + lipsum +
-                b')\n/A << /Type /Action /S /GoTo') in body
-
-
 # Make relative URL references work with our custom URL scheme.
-urlparse_uses_relative.append('weasyprint-custom')
+uses_relative.append('weasyprint-custom')
 
 
 @assert_no_logs
 def test_url_fetcher():
-    pattern_png = read_file(resource_filename('pattern.png'))
+    filename = resource_filename('pattern.png')
+    with open(filename, 'rb') as pattern_fd:
+        pattern_png = pattern_fd.read()
 
     def fetcher(url):
         if url == 'weasyprint-custom:foo/%C3%A9_%e9_pattern':
@@ -901,10 +819,12 @@ def test_url_fetcher():
     ''', base_url=base_url)
 
     def test(html, blank=False):
-        html = TestHTML(string=html, url_fetcher=fetcher, base_url=base_url)
+        html = FakeHTML(string=html, url_fetcher=fetcher, base_url=base_url)
         check_png_pattern(html.write_png(stylesheets=[css]), blank=blank)
 
     test('<body><img src="pattern.png">')  # Test a "normal" URL
+    test('<body><img src="%s">' % Path(filename).as_uri())
+    test('<body><img src="%s?ignored">' % Path(filename).as_uri())
     test('<body><img src="weasyprint-custom:foo/é_%e9_pattern">')
     test('<body style="background: url(weasyprint-custom:foo/é_%e9_pattern)">')
     test('<body><li style="list-style: inside '
@@ -916,12 +836,12 @@ def test_url_fetcher():
         test('<body><img src="custom:foo/bar">', blank=True)
     assert len(logs) == 1
     assert logs[0].startswith(
-        'WARNING: Failed to load image at custom:foo/bar')
+        'ERROR: Failed to load image at "custom:foo/bar"')
 
     def fetcher_2(url):
         assert url == 'weasyprint-custom:%C3%A9_%e9.css'
         return dict(string='', mime_type='text/css')
-    TestHTML(string='<link rel=stylesheet href="weasyprint-custom:'
+    FakeHTML(string='<link rel=stylesheet href="weasyprint-custom:'
                     'é_%e9.css"><body>', url_fetcher=fetcher_2).render()
 
 
@@ -936,7 +856,7 @@ def test_html_meta():
         meta.setdefault('created', None)
         meta.setdefault('modified', None)
         meta.setdefault('attachments', [])
-        assert vars(TestHTML(string=html).render().metadata) == meta
+        assert vars(FakeHTML(string=html).render().metadata) == meta
 
     assert_meta('<body>')
     assert_meta(
@@ -950,7 +870,7 @@ def test_html_meta():
             <meta name=dummy>
             <meta content=ignored>
             <meta>
-            <meta name=keywords content="html ,	css,
+            <meta name=keywords content="html ,\tcss,
                                          pdf,css">
             <meta name=dcterms.created content=2011-04>
             <meta name=dcterms.created content=2011-05>
@@ -1006,6 +926,7 @@ def test_http():
             (b'<html test=accept-encoding-header-fail>', [])
         ),
     }) as root_url:
-        assert HTML(root_url + '/gzip').root_element.get('test') == 'ok'
-        assert HTML(root_url + '/deflate').root_element.get('test') == 'ok'
-        assert HTML(root_url + '/raw-deflate').root_element.get('test') == 'ok'
+        assert HTML(root_url + '/gzip').etree_element.get('test') == 'ok'
+        assert HTML(root_url + '/deflate').etree_element.get('test') == 'ok'
+        assert HTML(
+            root_url + '/raw-deflate').etree_element.get('test') == 'ok'

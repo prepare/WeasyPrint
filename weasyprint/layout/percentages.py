@@ -1,16 +1,13 @@
-# coding: utf8
 """
     weasyprint.layout.percentages
     -----------------------------
 
     Resolve percentages into fixed values.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
-
-from __future__ import division, unicode_literals
 
 from ..formatting_structure import boxes
 
@@ -32,7 +29,8 @@ def _percentage(value, refer_to):
     return result
 
 
-def resolve_one_percentage(box, property_name, refer_to):
+def resolve_one_percentage(box, property_name, refer_to,
+                           main_flex_direction=None):
     """Set a used length value from a computed length value.
 
     ``refer_to`` is the length for 100%. If ``refer_to`` is not a number, it
@@ -42,7 +40,12 @@ def resolve_one_percentage(box, property_name, refer_to):
     # box.style has computed values
     value = box.style[property_name]
     # box attributes are used values
-    setattr(box, property_name, _percentage(value, refer_to))
+    percentage = _percentage(value, refer_to)
+    setattr(box, property_name, percentage)
+    if property_name in ('min_width', 'min_height') and percentage == 'auto':
+        if (main_flex_direction is None or
+                property_name != ('min_%s' % main_flex_direction)):
+            setattr(box, property_name, 0)
 
 
 def resolve_position_percentages(box, containing_block):
@@ -53,7 +56,7 @@ def resolve_position_percentages(box, containing_block):
     resolve_one_percentage(box, 'bottom', cb_height)
 
 
-def resolve_percentages(box, containing_block):
+def resolve_percentages(box, containing_block, main_flex_direction=None):
     """Set used values as attributes of the box object."""
     if isinstance(containing_block, boxes.Box):
         # cb is short for containing block
@@ -74,15 +77,15 @@ def resolve_percentages(box, containing_block):
     resolve_one_percentage(box, 'padding_top', maybe_height)
     resolve_one_percentage(box, 'padding_bottom', maybe_height)
     resolve_one_percentage(box, 'width', cb_width)
-    resolve_one_percentage(box, 'min_width', cb_width)
-    resolve_one_percentage(box, 'max_width', cb_width)
+    resolve_one_percentage(box, 'min_width', cb_width, main_flex_direction)
+    resolve_one_percentage(box, 'max_width', cb_width, main_flex_direction)
 
     # XXX later: top, bottom, left and right on positioned elements
 
     if cb_height == 'auto':
         # Special handling when the height of the containing block
         # depends on its content.
-        height = box.style.height
+        height = box.style['height']
         if height == 'auto' or height.unit == '%':
             box.height = 'auto'
         else:
@@ -100,20 +103,20 @@ def resolve_percentages(box, containing_block):
         prop = 'border_{0}_width'.format(side)
         setattr(box, prop, box.style[prop])
 
-    if box.style.box_sizing == 'border-box':
+    if box.style['box_sizing'] == 'border-box':
         if box.width != 'auto':
             box.width -= (box.padding_left + box.padding_right +
                           box.border_left_width + box.border_right_width)
         if box.height != 'auto':
             box.height -= (box.padding_top + box.padding_bottom +
                            box.border_top_width + box.border_bottom_width)
-    elif box.style.box_sizing == 'padding-box':
+    elif box.style['box_sizing'] == 'padding-box':
         if box.width != 'auto':
             box.width -= box.padding_left + box.padding_right
         if box.height != 'auto':
             box.height -= box.padding_top + box.padding_bottom
     else:
-        assert box.style.box_sizing == 'content-box'
+        assert box.style['box_sizing'] == 'content-box'
 
 
 def resolve_radii_percentages(box):

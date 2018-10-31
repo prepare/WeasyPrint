@@ -1,47 +1,42 @@
-# coding: utf8
 """
     weasyprint.images
     -----------------
 
     Fetch and decode images in various formats.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
-
-from io import BytesIO
 import math
+from io import BytesIO
+from xml.etree import ElementTree
 
 import cairocffi
-cairocffi.install_as_pycairo()  # for CairoSVG
-CAIRO_HAS_MIME_DATA = cairocffi.cairo_version() >= 11000
-
 import cairosvg.parser
 import cairosvg.surface
-assert cairosvg.surface.cairo is cairocffi, (
-    'CairoSVG is using pycairo instead of cairocffi. '
-    'Make sure it is not imported before WeasyPrint.')
+
+from .logger import LOGGER
+from .urls import URLFetchingError, fetch
 
 try:
     from cairocffi import pixbuf
 except OSError:
     pixbuf = None
 
-from .urls import fetch, URLFetchingError
-from .logger import LOGGER
-from .compat import xrange
+assert cairosvg.surface.cairo is cairocffi, (
+    'CairoSVG is using pycairo instead of cairocffi. '
+    'Make sure it is not imported before WeasyPrint.')
 
 
 # Map values of the image-rendering property to cairo FILTER values:
 # Values are normalized to lower case.
-IMAGE_RENDERING_TO_FILTER = dict(
-    optimizespeed=cairocffi.FILTER_FAST,
-    auto=cairocffi.FILTER_GOOD,
-    optimizequality=cairocffi.FILTER_BEST,
-)
+IMAGE_RENDERING_TO_FILTER = {
+    'auto': cairocffi.FILTER_BILINEAR,
+    'crisp-edges': cairocffi.FILTER_BEST,
+    'pixelated': cairocffi.FILTER_NEAREST,
+}
 
 
 class ImageLoadingError(ValueError):
@@ -67,7 +62,7 @@ class RasterImage(object):
             self._intrinsic_width / self._intrinsic_height
             if self._intrinsic_height != 0 else float('inf'))
 
-    def get_intrinsic_size(self, image_resolution):
+    def get_intrinsic_size(self, image_resolution, _font_size):
         # Raster images are affected by the 'image-resolution' property.
         return (self._intrinsic_width / image_resolution,
                 self._intrinsic_height / image_resolution)
@@ -96,49 +91,81 @@ class ScaledSVGSurface(cairosvg.surface.SVGSurface):
         return scale / 0.75
 
 
+class FakeSurface(object):
+    """Fake CairoSVG surface used to get SVG attributes."""
+    context_height = 0
+    context_width = 0
+    font_size = 12
+    dpi = 96
+
+
 class SVGImage(object):
-    def __init__(self, svg_data, base_url):
+    def __init__(self, svg_data, base_url, url_fetcher):
         # Don’t pass data URIs to CairoSVG.
         # They are useless for relative URIs anyway.
         self._base_url = (
             base_url if not base_url.lower().startswith('data:') else None)
         self._svg_data = svg_data
+        self._url_fetcher = url_fetcher
 
-        # TODO: find a way of not doing twice the whole rendering.
         try:
-            svg = self._render()
+            self._tree = ElementTree.fromstring(self._svg_data)
         except Exception as e:
             raise ImageLoadingError.from_exception(e)
-        # TODO: support SVG images with none or only one of intrinsic
-        #       width, height and ratio.
-        if not (svg.width > 0 and svg.height > 0):
-            raise ImageLoadingError(
-                'SVG images without an intrinsic size are not supported.')
-        self._intrinsic_width = svg.width
-        self._intrinsic_height = svg.height
-        self.intrinsic_ratio = self._intrinsic_width / self._intrinsic_height
 
-    def get_intrinsic_size(self, _image_resolution):
-        # Vector images are affected by the 'image-resolution' property.
+    def _cairosvg_url_fetcher(self, src, mimetype):
+        data = self._url_fetcher(src)
+        if 'string' in data:
+            return data['string']
+        return data['file_obj'].read()
+
+    def get_intrinsic_size(self, _image_resolution, font_size):
+        # Vector images may be affected by the font size.
+        fake_surface = FakeSurface()
+        fake_surface.font_size = font_size
+        # Percentages don't provide an intrinsic size, we transform percentages
+        # into 0 using a (0, 0) context size:
+        # http://www.w3.org/TR/SVG/coords.html#IntrinsicSizing
+        self._width = cairosvg.surface.size(
+            fake_surface, self._tree.get('width'))
+        self._height = cairosvg.surface.size(
+            fake_surface, self._tree.get('height'))
+        _, _, viewbox = cairosvg.surface.node_format(fake_surface, self._tree)
+        self._intrinsic_width = self._width or None
+        self._intrinsic_height = self._height or None
+        self.intrinsic_ratio = None
+        if viewbox:
+            if self._width and self._height:
+                self.intrinsic_ratio = self._width / self._height
+            else:
+                if viewbox[2] and viewbox[3]:
+                    self.intrinsic_ratio = viewbox[2] / viewbox[3]
+                    if self._width:
+                        self._intrinsic_height = (
+                            self._width / self.intrinsic_ratio)
+                    elif self._height:
+                        self._intrinsic_width = (
+                            self._height * self.intrinsic_ratio)
+        elif self._width and self._height:
+            self.intrinsic_ratio = self._width / self._height
         return self._intrinsic_width, self._intrinsic_height
 
-    def _render(self):
-        # Draw to a cairo surface but do not write to a file.
-        # This is a CairoSVG surface, not a cairo surface.
-        return ScaledSVGSurface(
-            cairosvg.parser.Tree(
-                bytestring=self._svg_data, url=self._base_url),
-            output=None, dpi=96)
-
     def draw(self, context, concrete_width, concrete_height, _image_rendering):
-        # Do not re-use the rendered Surface object,
-        # but regenerate it as needed.
-        # If a surface for a SVG image is still alive by the time we call
-        # show_page(), cairo will rasterize the image instead writing vectors.
-        svg = self._render()
-        context.scale(concrete_width / svg.width, concrete_height / svg.height)
-        context.set_source_surface(svg.cairo)
-        context.paint()
+        try:
+            svg = ScaledSVGSurface(
+                cairosvg.parser.Tree(
+                    bytestring=self._svg_data, url=self._base_url,
+                    url_fetcher=self._cairosvg_url_fetcher),
+                output=None, dpi=96, parent_width=concrete_width,
+                parent_height=concrete_height)
+            if svg.width and svg.height:
+                context.scale(
+                    concrete_width / svg.width, concrete_height / svg.height)
+                context.set_source_surface(svg.cairo)
+                context.paint()
+        except Exception as e:
+            LOGGER.error(
+                'Failed to draw an SVG image at %s : %s', self._base_url, e)
 
 
 def get_image_from_uri(cache, url_fetcher, url, forced_mime_type=None):
@@ -150,35 +177,50 @@ def get_image_from_uri(cache, url_fetcher, url, forced_mime_type=None):
 
     try:
         with fetch(url_fetcher, url) as result:
+            if 'string' in result:
+                string = result['string']
+            else:
+                string = result['file_obj'].read()
             mime_type = forced_mime_type or result['mime_type']
             if mime_type == 'image/svg+xml':
-                string = (result['string'] if 'string' in result
-                          else result['file_obj'].read())
-                image = SVGImage(string, url)
-            elif mime_type == 'image/png':
-                obj = result.get('file_obj') or BytesIO(result.get('string'))
-                try:
-                    surface = cairocffi.ImageSurface.create_from_png(obj)
-                except Exception as exc:
-                    raise ImageLoadingError.from_exception(exc)
-                image = RasterImage(surface)
+                # No fallback for XML-based mimetypes as defined by MIME
+                # Sniffing Standard, see https://mimesniff.spec.whatwg.org/
+                image = SVGImage(string, url, url_fetcher)
             else:
-                if pixbuf is None:
-                    raise ImageLoadingError(
-                        'Could not load GDK-Pixbuf. '
-                        'PNG and SVG are the only image formats available.')
-                string = (result['string'] if 'string' in result
-                          else result['file_obj'].read())
+                # Try to rely on given mimetype
                 try:
-                    surface, format_name = (
-                        pixbuf.decode_to_image_surface(string))
-                except pixbuf.ImageLoadingError as exc:
-                    raise ImageLoadingError(str(exc))
-                if format_name == 'jpeg' and CAIRO_HAS_MIME_DATA:
-                    surface.set_mime_data('image/jpeg', string)
-                image = RasterImage(surface)
+                    if mime_type == 'image/png':
+                        try:
+                            surface = cairocffi.ImageSurface.create_from_png(
+                                BytesIO(string))
+                        except Exception as exception:
+                            raise ImageLoadingError.from_exception(exception)
+                        else:
+                            image = RasterImage(surface)
+                    else:
+                        image = None
+                except ImageLoadingError:
+                    image = None
+
+                # Relying on mimetype didn't work, give the image to GDK-Pixbuf
+                if not image:
+                    if pixbuf is None:
+                        raise ImageLoadingError(
+                            'Could not load GDK-Pixbuf. PNG and SVG are '
+                            'the only image formats available.')
+                    try:
+                        image = SVGImage(string, url, url_fetcher)
+                    except BaseException:
+                        try:
+                            surface, format_name = (
+                                pixbuf.decode_to_image_surface(string))
+                        except pixbuf.ImageLoadingError as exception:
+                            raise ImageLoadingError(str(exception))
+                        if format_name == 'jpeg':
+                            surface.set_mime_data('image/jpeg', string)
+                        image = RasterImage(surface)
     except (URLFetchingError, ImageLoadingError) as exc:
-        LOGGER.warning('Failed to load image at %s : %s', url, exc)
+        LOGGER.error('Failed to load image at "%s" (%s)', url, exc)
         image = None
     cache[url] = image
     return image
@@ -229,7 +271,7 @@ def process_color_stops(gradient_line_size, positions):
         if position is not None:
             base = positions[previous_i]
             increment = (position - base) / (i - previous_i)
-            for j in xrange(previous_i + 1, i):
+            for j in range(previous_i + 1, i):
                 positions[j] = base + j * increment
             previous_i = i
     return positions
@@ -291,8 +333,8 @@ class Gradient(object):
         #: bool
         self.repeating = repeating
 
-    def get_intrinsic_size(self, _image_resolution):
-        # Raster images are affected by the 'image-resolution' property.
+    def get_intrinsic_size(self, _image_resolution, _font_size):
+        # Gradients are not affected by image resolution, parent or font size.
         return None, None
 
     intrinsic_ratio = None

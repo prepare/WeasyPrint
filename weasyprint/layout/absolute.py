@@ -1,21 +1,18 @@
-# coding: utf8
 """
     weasyprint.absolute
     -------------------
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
-
-from .percentages import resolve_percentages, resolve_position_percentages
-from .preferred import shrink_to_fit
+from ..formatting_structure import boxes
 from .markers import list_marker_layout
 from .min_max import handle_min_max_width
+from .percentages import resolve_percentages, resolve_position_percentages
+from .preferred import shrink_to_fit
 from .tables import table_wrapper_width
-from ..formatting_structure import boxes
 
 
 class AbsolutePlaceholder(object):
@@ -30,9 +27,11 @@ class AbsolutePlaceholder(object):
         object.__setattr__(self, '_box', new_box)
         object.__setattr__(self, '_layout_done', True)
 
-    def translate(self, dx=0, dy=0):
+    def translate(self, dx=0, dy=0, ignore_floats=False):
+        if dx == 0 and dy == 0:
+            return
         if self._layout_done:
-            self._box.translate(dx, dy)
+            self._box.translate(dx, dy, ignore_floats)
         else:
             # Descendants do not have a position yet.
             self._box.position_x += dx
@@ -230,6 +229,49 @@ def absolute_block(context, box, containing_block, fixed_boxes):
     return new_box
 
 
+def absolute_flex(context, box, containing_block_sizes, fixed_boxes,
+                  containing_block):
+    # Avoid a circular import
+    from .flex import flex_layout
+
+    # TODO: this function is really close to absolute_block, we should have
+    # only one function.
+    # TODO: having containing_block_sizes and containing_block is stupid.
+    cb_x, cb_y, cb_width, cb_height = containing_block_sizes
+
+    translate_box_width, translate_x = absolute_width(
+        box, context, containing_block_sizes)
+    translate_box_height, translate_y = absolute_height(
+        box, context, containing_block_sizes)
+
+    # This box is the containing block for absolute descendants.
+    absolute_boxes = []
+
+    if box.is_table_wrapper:
+        table_wrapper_width(context, box, (cb_width, cb_height))
+
+    # TODO: remove device_size everywhere else
+    new_box, _, _, _, _ = flex_layout(
+        context, box, max_position_y=float('inf'), skip_stack=None,
+        containing_block=containing_block, device_size=None,
+        page_is_empty=False, absolute_boxes=absolute_boxes,
+        fixed_boxes=fixed_boxes)
+
+    list_marker_layout(context, new_box)
+
+    for child_placeholder in absolute_boxes:
+        absolute_layout(context, child_placeholder, new_box, fixed_boxes)
+
+    if translate_box_width:
+        translate_x -= new_box.width
+    if translate_box_height:
+        translate_y -= new_box.height
+
+    new_box.translate(translate_x, translate_y)
+
+    return new_box
+
+
 def absolute_layout(context, placeholder, containing_block, fixed_boxes):
     """Set the width of absolute positioned ``box``."""
     assert not placeholder._layout_done
@@ -261,6 +303,9 @@ def absolute_box_layout(context, box, containing_block, fixed_boxes):
     # Absolute tables are wrapped into block boxes
     if isinstance(box, boxes.BlockBox):
         new_box = absolute_block(context, box, containing_block, fixed_boxes)
+    elif isinstance(box, boxes.FlexContainerBox):
+        new_box = absolute_flex(
+            context, box, containing_block, fixed_boxes, cb)
     else:
         assert isinstance(box, boxes.BlockReplacedBox)
         new_box = absolute_replaced(context, box, containing_block)
@@ -274,7 +319,7 @@ def absolute_replaced(context, box, containing_block):
     inline_replaced_box_width_height(box, device_size=None)
 
     cb_x, cb_y, cb_width, cb_height = containing_block
-    ltr = box.style.direction == 'ltr'
+    ltr = box.style['direction'] == 'ltr'
 
     # http://www.w3.org/TR/CSS21/visudet.html#abs-replaced-width
     if box.left == box.right == 'auto':

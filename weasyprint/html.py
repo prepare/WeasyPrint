@@ -1,5 +1,3 @@
-
-# coding: utf8
 """
     weasyprint.html
     ---------------
@@ -11,30 +9,28 @@
     have intrinsic dimensions. But the only replaced elements currently
     supported in WeasyPrint are images with intrinsic dimensions.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
-import os.path
 import logging
+import os.path
 import re
+from urllib.parse import urljoin
 
+from . import CSS, ROOT
 from .css import get_child_text
 from .formatting_structure import boxes
-from .urls import get_url_attribute
-from .compat import xrange, urljoin
 from .logger import LOGGER
-from . import CSS
-
+from .urls import get_url_attribute
 
 # XXX temporarily disable logging for user-agent stylesheet
 level = LOGGER.level
 LOGGER.setLevel(logging.ERROR)
 
-HTML5_UA_STYLESHEET = CSS(
-    filename=os.path.join(os.path.dirname(__file__), 'css', 'html5_ua.css'))
+HTML5_UA_STYLESHEET = CSS(filename=os.path.join(ROOT, 'css', 'html5_ua.css'))
+HTML5_PH_STYLESHEET = CSS(filename=os.path.join(ROOT, 'css', 'html5_ph.css'))
 
 LOGGER.setLevel(level)
 
@@ -83,13 +79,14 @@ def element_has_link_type(element, link_type):
 HTML_HANDLERS = {}
 
 
-def handle_element(element, box, get_image_from_uri):
+def handle_element(element, box, get_image_from_uri, base_url):
     """Handle HTML elements that need special care.
 
     :returns: a (possibly empty) list of boxes.
     """
     if box.element_tag in HTML_HANDLERS:
-        return HTML_HANDLERS[element.tag](element, box, get_image_from_uri)
+        return HTML_HANDLERS[element.tag](
+            element, box, get_image_from_uri, base_url)
     else:
         return [box]
 
@@ -110,22 +107,22 @@ def make_replaced_box(element, box, image):
     element should be.
 
     """
-    if box.style.display in ('block', 'list-item', 'table'):
+    if box.style['display'] in ('block', 'list-item', 'table'):
         type_ = boxes.BlockReplacedBox
     else:
         # TODO: support images with 'display: table-cell'?
         type_ = boxes.InlineReplacedBox
-    return type_(element.tag, element.sourceline, box.style, image)
+    return type_(element.tag, box.style, image)
 
 
 @handler('img')
-def handle_img(element, box, get_image_from_uri):
+def handle_img(element, box, get_image_from_uri, base_url):
     """Handle ``<img>`` elements, return either an image or the alt-text.
 
     See: http://www.w3.org/TR/html5/embedded-content-1.html#the-img-element
 
     """
-    src = get_url_attribute(element, 'src')
+    src = get_url_attribute(element, 'src', base_url)
     alt = element.get('alt')
     if src:
         image = get_image_from_uri(src)
@@ -134,8 +131,8 @@ def handle_img(element, box, get_image_from_uri):
         else:
             # Invalid image, use the alt-text.
             if alt:
-                return [box.copy_with_children(
-                    [boxes.TextBox.anonymous_from(box, alt)])]
+                box.children = [boxes.TextBox.anonymous_from(box, alt)]
+                return [box]
             elif alt == '':
                 # The element represents nothing
                 return []
@@ -146,20 +143,20 @@ def handle_img(element, box, get_image_from_uri):
                 return []
     else:
         if alt:
-            return [box.copy_with_children(
-                [boxes.TextBox.anonymous_from(box, alt)])]
+            box.children = [boxes.TextBox.anonymous_from(box, alt)]
+            return [box]
         else:
             return []
 
 
 @handler('embed')
-def handle_embed(element, box, get_image_from_uri):
+def handle_embed(element, box, get_image_from_uri, base_url):
     """Handle ``<embed>`` elements, return either an image or nothing.
 
-    See: http://www.w3.org/TR/html5/the-iframe-element.html#the-embed-element
+    See: https://www.w3.org/TR/html5/embedded-content-0.html#the-embed-element
 
     """
-    src = get_url_attribute(element, 'src')
+    src = get_url_attribute(element, 'src', base_url)
     type_ = element.get('type', '').strip()
     if src:
         image = get_image_from_uri(src, type_)
@@ -170,14 +167,14 @@ def handle_embed(element, box, get_image_from_uri):
 
 
 @handler('object')
-def handle_object(element, box, get_image_from_uri):
+def handle_object(element, box, get_image_from_uri, base_url):
     """Handle ``<object>`` elements, return either an image or the fallback
     content.
 
-    See: http://www.w3.org/TR/html5/the-iframe-element.html#the-object-element
+    See: https://www.w3.org/TR/html5/embedded-content-0.html#the-object-element
 
     """
-    data = get_url_attribute(element, 'data')
+    data = get_url_attribute(element, 'data', base_url)
     type_ = element.get('type', '').strip()
     if data:
         image = get_image_from_uri(data, type_)
@@ -203,7 +200,7 @@ def integer_attribute(element, box, name, minimum=1):
 
 
 @handler('colgroup')
-def handle_colgroup(element, box, _get_image_from_uri):
+def handle_colgroup(element, box, _get_image_from_uri, _base_url):
     """Handle the ``span`` attribute."""
     if isinstance(box, boxes.TableColumnGroupBox):
         if any(child.tag == 'col' for child in element):
@@ -212,25 +209,25 @@ def handle_colgroup(element, box, _get_image_from_uri):
             integer_attribute(element, box, 'span')
             box.children = (
                 boxes.TableColumnBox.anonymous_from(box, [])
-                for _i in xrange(box.span))
+                for _i in range(box.span))
     return [box]
 
 
 @handler('col')
-def handle_col(element, box, _get_image_from_uri):
+def handle_col(element, box, _get_image_from_uri, _base_url):
     """Handle the ``span`` attribute."""
     if isinstance(box, boxes.TableColumnBox):
         integer_attribute(element, box, 'span')
         if box.span > 1:
             # Generate multiple boxes
             # http://lists.w3.org/Archives/Public/www-style/2011Nov/0293.html
-            return [box.copy() for _i in xrange(box.span)]
+            return [box.copy() for _i in range(box.span)]
     return [box]
 
 
 @handler('th')
 @handler('td')
-def handle_td(element, box, _get_image_from_uri):
+def handle_td(element, box, _get_image_from_uri, _base_url):
     """Handle the ``colspan``, ``rowspan`` attributes."""
     if isinstance(box, boxes.TableCellBox):
         # HTML 4.01 gives special meaning to colspan=0
@@ -244,7 +241,7 @@ def handle_td(element, box, _get_image_from_uri):
 
 
 @handler('a')
-def handle_a(element, box, _get_image_from_uri):
+def handle_a(element, box, _get_image_from_uri, base_url):
     """Handle the ``rel`` attribute."""
     box.is_attachment = element_has_link_type(element, 'attachment')
     return [box]
@@ -264,7 +261,7 @@ def find_base_url(html_document, fallback_base_url):
     return fallback_base_url
 
 
-def get_html_metadata(html_document):
+def get_html_metadata(wrapper_element, base_url):
     """
     Relevant specs:
 
@@ -282,7 +279,8 @@ def get_html_metadata(html_document):
     created = None
     modified = None
     attachments = []
-    for element in html_document.iter('title', 'meta', 'link'):
+    for element in wrapper_element.query_all('title', 'meta', 'link'):
+        element = element.etree_element
         if element.tag == 'title' and title is None:
             title = get_child_text(element)
         elif element.tag == 'meta':
@@ -299,15 +297,15 @@ def get_html_metadata(html_document):
             elif name == 'generator' and generator is None:
                 generator = content
             elif name == 'dcterms.created' and created is None:
-                created = parse_w3c_date(name, element.sourceline, content)
+                created = parse_w3c_date(name, content)
             elif name == 'dcterms.modified' and modified is None:
-                modified = parse_w3c_date(name, element.sourceline, content)
+                modified = parse_w3c_date(name, content)
         elif element.tag == 'link' and element_has_link_type(
                 element, 'attachment'):
-            url = get_url_attribute(element, 'href')
+            url = get_url_attribute(element, 'href', base_url)
             title = element.get('title', None)
             if url is None:
-                LOGGER.warning('Missing href in <link rel="attachment">')
+                LOGGER.error('Missing href in <link rel="attachment">')
             else:
                 attachments.append((url, title))
     return dict(title=title, description=description, generator=generator,
@@ -324,7 +322,7 @@ def strip_whitespace(string):
     http://www.whatwg.org/html#space-character
 
     """
-    return string.strip(' \t\n\f\r')
+    return string.strip(HTML_WHITESPACE)
 
 
 # YYYY (eg 1997)
@@ -337,22 +335,22 @@ def strip_whitespace(string):
 W3C_DATE_RE = re.compile('''
     ^
     [ \t\n\f\r]*
-    (?P<year>\d\d\d\d)
+    (?P<year>\\d\\d\\d\\d)
     (?:
-        -(?P<month>0\d|1[012])
+        -(?P<month>0\\d|1[012])
         (?:
-            -(?P<day>[012]\d|3[01])
+            -(?P<day>[012]\\d|3[01])
             (?:
-                T(?P<hour>[01]\d|2[0-3])
-                :(?P<minute>[0-5]\d)
+                T(?P<hour>[01]\\d|2[0-3])
+                :(?P<minute>[0-5]\\d)
                 (?:
-                    :(?P<second>[0-5]\d)
-                    (?:\.\d+)?  # Second fraction, ignored
+                    :(?P<second>[0-5]\\d)
+                    (?:\\.\\d+)?  # Second fraction, ignored
                 )?
                 (?:
                     Z |  # UTC
-                    (?P<tz_hour>[+-](?:[01]\d|2[0-3]))
-                    :(?P<tz_minute>[0-5]\d)
+                    (?P<tz_hour>[+-](?:[01]\\d|2[0-3]))
+                    :(?P<tz_minute>[0-5]\\d)
                 )
             )?
         )?
@@ -362,10 +360,10 @@ W3C_DATE_RE = re.compile('''
 ''', re.VERBOSE)
 
 
-def parse_w3c_date(meta_name, source_line, string):
+def parse_w3c_date(meta_name, string):
     """http://www.w3.org/TR/NOTE-datetime"""
     if W3C_DATE_RE.match(string):
         return string
     else:
-        LOGGER.warning('Invalid date in <meta name="%s"> line %i: %r',
-                       meta_name, source_line, string)
+        LOGGER.warning(
+            'Invalid date in <meta name="%s"> %r', meta_name, string)

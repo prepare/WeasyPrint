@@ -1,4 +1,3 @@
-# coding: utf8
 """
     weasyprint.formatting_structure.boxes
     -------------------------------------
@@ -52,21 +51,16 @@
 
     See respective docstrings for details.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
-
 import itertools
 
-from ..compat import xrange
-from ..css.computed_values import ZERO_PIXELS
+from ..css import computed_from_cascaded
+from ..css.properties import Dimension
 
-
-# The *Box classes have many attributes and methods, but that's the way it is
-# pylint: disable=R0904,R0902
 
 class Box(object):
     """Abstract base class for all boxes."""
@@ -76,32 +70,36 @@ class Box(object):
     internal_table_or_caption = False
     tabular_container = False
 
+    # Keep track of removed collapsing spaces for wrap opportunities.
+    leading_collapsible_space = False
+    trailing_collapsible_space = False
+
     # Default, may be overriden on instances.
     is_table_wrapper = False
+    is_flex_item = False
     is_for_root_element = False
+    is_column = False
     transformation_matrix = None
+    bookmark_label = None
+    string_set = None
 
     # Default, overriden on some subclasses
     def all_children(self):
         return ()
 
-    def __init__(self, element_tag, sourceline, style):
+    def __init__(self, element_tag, style):
         self.element_tag = element_tag
-        self.sourceline = sourceline  # for debugging only
-        # Copying might not be needed, but let’s be careful with mutable
-        # objects.
-        self.style = style.copy()
+        self.style = style
 
     def __repr__(self):
-        return '<%s %s %s>' % (
-            type(self).__name__, self.element_tag, self.sourceline)
+        return '<%s %s>' % (type(self).__name__, self.element_tag)
 
     @classmethod
     def anonymous_from(cls, parent, *args, **kwargs):
         """Return an anonymous box that inherits from ``parent``."""
-        return cls(parent.element_tag, parent.sourceline,
-                   parent.style.inherit_from(),
-                   *args, **kwargs)
+        style = computed_from_cascaded(
+            cascaded={}, parent_style=parent.style, element=None)
+        return cls(parent.element_tag, style, *args, **kwargs)
 
     def copy(self):
         """Return shallow copy of the box."""
@@ -111,20 +109,23 @@ class Box(object):
         new_box = cls.__new__(cls)
         # Copy attributes
         new_box.__dict__.update(self.__dict__)
-        new_box.style = self.style.copy()
+        new_box.style = self.style
         return new_box
 
-    def translate(self, dx=0, dy=0):
+    def translate(self, dx=0, dy=0, ignore_floats=False):
         """Change the box’s position.
 
         Also update the children’s positions accordingly.
 
         """
         # Overridden in ParentBox to also translate children, if any.
+        if dx == 0 and dy == 0:
+            return
         self.position_x += dx
         self.position_y += dy
         for child in self.all_children():
-            child.translate(dx, dy)
+            if not (ignore_floats and child.is_floated()):
+                child.translate(dx, dy, ignore_floats)
 
     # Heights and widths
 
@@ -266,21 +267,27 @@ class Box(object):
 
     def is_floated(self):
         """Return whether this box is floated."""
-        return self.style.float != 'none'
+        return self.style['float'] != 'none'
 
     def is_absolutely_positioned(self):
         """Return whether this box is in the absolute positioning scheme."""
-        return self.style.position in ('absolute', 'fixed')
+        return self.style['position'] in ('absolute', 'fixed')
 
     def is_in_normal_flow(self):
         """Return whether this box is in normal flow."""
         return not (self.is_floated() or self.is_absolutely_positioned())
 
+    # Start and end page values for named pages
+
+    def page_values(self):
+        """Return start and end page values."""
+        return (self.style['page'], self.style['page'])
+
 
 class ParentBox(Box):
     """A box that has children."""
-    def __init__(self, element_tag, sourceline, style, children):
-        super(ParentBox, self).__init__(element_tag, sourceline, style)
+    def __init__(self, element_tag, style, children):
+        super(ParentBox, self).__init__(element_tag, style)
         self.children = tuple(children)
 
     def all_children(self):
@@ -292,20 +299,21 @@ class ParentBox(Box):
         ``skip_num`` children are skipped before iterating over them.
 
         """
-        for index in xrange(skip_num, len(self.children)):
+        for index in range(skip_num, len(self.children)):
             yield index, self.children[index]
 
     def _reset_spacing(self, side):
         """Set to 0 the margin, padding and border of ``side``."""
+        self.style['margin_%s' % side] = Dimension(0, 'px')
+        self.style['padding_%s' % side] = Dimension(0, 'px')
+        self.style['border_%s_width' % side] = 0
         setattr(self, 'margin_%s' % side, 0)
         setattr(self, 'padding_%s' % side, 0)
         setattr(self, 'border_%s_width' % side, 0)
 
-        self.style['margin_%s' % side] = ZERO_PIXELS
-        self.style['padding_%s' % side] = ZERO_PIXELS
-        self.style['border_%s_width' % side] = 0
-
     def _remove_decoration(self, start, end):
+        if start or end:
+            self.style = self.style.copy()
         if start:
             self._reset_spacing('top')
         if end:
@@ -338,6 +346,14 @@ class ParentBox(Box):
                     return child
             else:  # pragma: no cover
                 raise ValueError('Table wrapper without a table')
+
+    def page_values(self):
+        start_value, end_value = super(ParentBox, self).page_values()
+        if self.children:
+            start_box, end_box = self.children[0], self.children[-1]
+            start_value = start_box.page_values()[0] or start_value
+            end_value = end_box.page_values()[1] or end_value
+        return start_value, end_value
 
 
 class BlockLevelBox(Box):
@@ -387,9 +403,6 @@ class LineBox(ParentBox):
     be split into multiple line boxes, one for each actual line.
 
     """
-    def __init__(self, element_tag, sourceline, style, children):
-        assert style.anonymous
-        super(LineBox, self).__init__(element_tag, sourceline, style, children)
 
 
 class InlineLevelBox(Box):
@@ -403,7 +416,9 @@ class InlineLevelBox(Box):
 
     """
     def _remove_decoration(self, start, end):
-        ltr = self.style.direction == 'ltr'
+        if start or end:
+            self.style = self.style.copy()
+        ltr = self.style['direction'] == 'ltr'
         if start:
             self._reset_spacing('left' if ltr else 'right')
         if end:
@@ -434,19 +449,25 @@ class TextBox(InlineLevelBox):
     inline boxes" are also text boxes.
 
     """
-    def __init__(self, element_tag, sourceline, style, text):
-        assert style.anonymous
+    justification_spacing = 0
+
+    # http://stackoverflow.com/questions/16317534/
+    ascii_to_wide = dict((i, chr(i + 0xfee0)) for i in range(0x21, 0x7f))
+    ascii_to_wide.update({0x20: '\u3000', 0x2D: '\u2212'})
+
+    def __init__(self, element_tag, style, text):
         assert text
-        super(TextBox, self).__init__(element_tag, sourceline, style)
-        text_transform = style.text_transform
+        super(TextBox, self).__init__(element_tag, style)
+        text_transform = style['text_transform']
         if text_transform != 'none':
             text = {
                 'uppercase': lambda t: t.upper(),
                 'lowercase': lambda t: t.lower(),
                 # Python’s unicode.captitalize is not the same.
                 'capitalize': lambda t: t.title(),
+                'full-width': lambda t: t.translate(self.ascii_to_wide),
             }[text_transform](text)
-        if style.hyphens == 'none':
+        if style['hyphens'] == 'none':
             text = text.replace('\u00AD', '')  # U+00AD SOFT HYPHEN (SHY)
         self.text = text
 
@@ -484,8 +505,8 @@ class ReplacedBox(Box):
     and is opaque from CSS’s point of view.
 
     """
-    def __init__(self, element_tag, sourceline, style, replacement):
-        super(ReplacedBox, self).__init__(element_tag, sourceline, style)
+    def __init__(self, element_tag, style, replacement):
+        super(ReplacedBox, self).__init__(element_tag, style)
         self.replacement = replacement
 
 
@@ -517,10 +538,15 @@ class TableBox(BlockLevelBox, ParentBox):
     def all_children(self):
         return itertools.chain(self.children, self.column_groups)
 
-    def translate(self, dx=0, dy=0):
+    def translate(self, dx=0, dy=0, ignore_floats=False):
+        if dx == 0 and dy == 0:
+            return
         self.column_positions = [
             position + dx for position in self.column_positions]
-        return super(TableBox, self).translate(dx, dy)
+        return super(TableBox, self).translate(dx, dy, ignore_floats)
+
+    def page_values(self):
+        return (self.style['page'], self.style['page'])
 
 
 class InlineTableBox(TableBox):
@@ -567,6 +593,11 @@ class TableColumnGroupBox(ParentBox):
     padding_left = 0
     padding_right = 0
 
+    def get_cells(self):
+        """Return cells that originate in the group's columns."""
+        return [
+            cell for column in self.children for cell in column.get_cells()]
+
 
 # Not really a parent box, but pretending to be removes some corner cases.
 class TableColumnBox(ParentBox):
@@ -588,6 +619,14 @@ class TableColumnBox(ParentBox):
     padding_bottom = 0
     padding_left = 0
     padding_right = 0
+
+    def get_cells(self):
+        """Return cells that originate in the column.
+
+        May be overriden on instances.
+
+        """
+        return []
 
 
 class TableCellBox(BlockContainerBox):
@@ -617,7 +656,7 @@ class PageBox(ParentBox):
         self.page_type = page_type
         # Page boxes are not linked to any element.
         super(PageBox, self).__init__(
-            element_tag=None, sourceline=None, style=style, children=[])
+            element_tag=None, style=style, children=[])
 
     def __repr__(self):
         return '<%s %s>' % (type(self).__name__, self.page_type)
@@ -625,11 +664,31 @@ class PageBox(ParentBox):
 
 class MarginBox(BlockContainerBox):
     """Box in page margins, as defined in CSS3 Paged Media"""
-    def __init__(self, at_keyword, style, children=[]):
+    def __init__(self, at_keyword, style):
         self.at_keyword = at_keyword
         # Margin boxes are not linked to any element.
         super(MarginBox, self).__init__(
-            element_tag=None, sourceline=None, style=style, children=children)
+            element_tag=None, style=style, children=[])
 
     def __repr__(self):
         return '<%s %s>' % (type(self).__name__, self.at_keyword)
+
+
+class FlexContainerBox(ParentBox):
+    """A box that contains only flex-items."""
+
+
+class FlexBox(FlexContainerBox, BlockLevelBox):
+    """A box that is both block-level and a flex container.
+
+    It behaves as block on the outside and as a flex container on the inside.
+
+    """
+
+
+class InlineFlexBox(FlexContainerBox, InlineLevelBox):
+    """A box that is both inline-level and a flex container.
+
+    It behaves as inline on the outside and as a flex container on the inside.
+
+    """

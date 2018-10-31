@@ -1,21 +1,22 @@
-# coding: utf8
 """
     weasyprint.layout.preferred
     ---------------------------
 
-    Preferred and minimum preferred width, aka. the shrink-to-fit algorithm.
+    Preferred and minimum preferred width, aka. max-content and min-content
+    width, aka. the shrink-to-fit algorithm.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    Terms used (max-content width, min-content width) are defined in David
+    Baron's unofficial draft (http://dbaron.org/css/intrinsic/).
+
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
+import sys
 
-import weakref
-
-from ..formatting_structure import boxes
 from .. import text
+from ..formatting_structure import boxes
 from .replaced import default_image_sizing
 
 
@@ -30,59 +31,70 @@ def shrink_to_fit(context, box, available_width):
     """
     return min(
         max(
-            preferred_minimum_width(context, box, outer=False),
+            min_content_width(context, box, outer=False),
             available_width),
-        preferred_width(context, box, outer=False))
+        max_content_width(context, box, outer=False))
 
 
-def preferred_minimum_width(context, box, outer=True):
-    """Return the preferred minimum width for ``box``.
+def min_content_width(context, box, outer=True):
+    """Return the min-content width for ``box``.
 
     This is the width by breaking at every line-break opportunity.
 
     """
-    if isinstance(box, boxes.BlockContainerBox):
+    if isinstance(box, (
+            boxes.BlockContainerBox, boxes.TableColumnBox, boxes.FlexBox)):
         if box.is_table_wrapper:
-            return table_preferred_minimum_width(context, box, outer)
+            return table_and_columns_preferred_widths(context, box, outer)[0]
         else:
-            return block_preferred_minimum_width(context, box, outer)
+            return block_min_content_width(context, box, outer)
+    elif isinstance(box, boxes.TableColumnGroupBox):
+        return column_group_content_width(context, box)
     elif isinstance(box, (boxes.InlineBox, boxes.LineBox)):
-        return inline_preferred_minimum_width(
+        return inline_min_content_width(
             context, box, outer, is_line_start=True)
     elif isinstance(box, boxes.ReplacedBox):
-        return replaced_preferred_width(box, outer)
+        return replaced_min_content_width(box, outer)
+    elif isinstance(box, boxes.FlexContainerBox):
+        return flex_min_content_width(context, box, outer)
     else:
         raise TypeError(
-            'Preferred minimum width for %s not handled yet' %
+            'min-content width for %s not handled yet' %
             type(box).__name__)
 
 
-def preferred_width(context, box, outer=True):
-    """Return the preferred width for ``box``.
+def max_content_width(context, box, outer=True):
+    """Return the max-content width for ``box``.
 
     This is the width by only breaking at forced line breaks.
 
     """
-    if isinstance(box, boxes.BlockContainerBox):
+    if isinstance(box, (
+            boxes.BlockContainerBox, boxes.TableColumnBox, boxes.FlexBox)):
         if box.is_table_wrapper:
-            return table_preferred_width(context, box, outer)
+            return table_and_columns_preferred_widths(context, box, outer)[1]
         else:
-            return block_preferred_width(context, box, outer)
+            return block_max_content_width(context, box, outer)
+    elif isinstance(box, boxes.TableColumnGroupBox):
+        return column_group_content_width(context, box)
     elif isinstance(box, (boxes.InlineBox, boxes.LineBox)):
-        return inline_preferred_width(context, box, outer, is_line_start=True)
+        return inline_max_content_width(
+            context, box, outer, is_line_start=True)
     elif isinstance(box, boxes.ReplacedBox):
-        return replaced_preferred_width(box, outer)
+        return replaced_max_content_width(box, outer)
+    elif isinstance(box, boxes.FlexContainerBox):
+        return flex_max_content_width(context, box, outer)
     else:
         raise TypeError(
-            'Preferred width for %s not handled yet' % type(box).__name__)
+            'max-content width for %s not handled yet' % type(box).__name__)
 
 
-def _block_preferred_width(context, box, function, outer):
-    """Helper to create ``block_preferred_*_width.``"""
-    width = box.style.width
+def _block_content_width(context, box, function, outer):
+    """Helper to create ``block_*_content_width.``"""
+    width = box.style['width']
     if width == 'auto' or width.unit == '%':
         # "percentages on the following properties are treated instead as
-        #  though they were the following: width: auto"
+        # though they were the following: width: auto"
         # http://dbaron.org/css/intrinsic/#outer-intrinsic
         children_widths = [
             function(context, child, outer=True) for child in box.children
@@ -95,117 +107,124 @@ def _block_preferred_width(context, box, function, outer):
     return adjust(box, outer, width)
 
 
-def adjust(box, outer, width, left=True, right=True):
-    """Add paddings, borders and margins to ``width`` when ``outer`` is set."""
-    if not outer:
-        return width
+def min_max(box, width):
+    """Get box width from given width and box min- and max-widths."""
+    min_width = box.style['min_width']
+    max_width = box.style['max_width']
+    if min_width == 'auto' or min_width.unit == '%':
+        min_width = 0
+    else:
+        min_width = min_width.value
+    if max_width == 'auto' or max_width.unit == '%':
+        max_width = float('inf')
+    else:
+        max_width = max_width.value
+    return max(min_width, min(width, max_width))
 
-    min_width = box.style.min_width
-    max_width = box.style.max_width
-    min_width = min_width.value if min_width.unit != '%' else 0
-    max_width = max_width.value if max_width.unit != '%' else float('inf')
 
-    fixed = max(min_width, min(width, max_width))
+def margin_width(box, width, left=True, right=True):
+    """Add box paddings, borders and margins to ``width``."""
     percentages = 0
 
     for value in (
         (['margin_left', 'padding_left'] if left else []) +
         (['margin_right', 'padding_right'] if right else [])
     ):
-        # Padding and border are set on the table, not on the wrapper
-        # http://www.w3.org/TR/CSS21/tables.html#model
-        # TODO: clean this horrible hack!
-        if box.is_table_wrapper and value == 'padding_left':
-            box = box.get_wrapped_table()
-
         style_value = box.style[value]
         if style_value != 'auto':
             if style_value.unit == 'px':
-                fixed += style_value.value
+                width += style_value.value
             else:
                 assert style_value.unit == '%'
                 percentages += style_value.value
 
     if left:
-        fixed += box.style.border_left_width
+        width += box.style['border_left_width']
     if right:
-        fixed += box.style.border_right_width
+        width += box.style['border_right_width']
 
     if percentages < 100:
-        return fixed / (1 - percentages / 100.)
+        return width / (1 - percentages / 100.)
     else:
         # Pathological case, ignore
         return 0
 
 
-def block_preferred_minimum_width(context, box, outer=True):
-    """Return the preferred minimum width for a ``BlockBox``."""
-    return _block_preferred_width(
-        context, box, preferred_minimum_width, outer)
+def adjust(box, outer, width, left=True, right=True):
+    """Respect min/max and adjust width depending on ``outer``.
+
+    If ``outer`` is set to ``True``, return margin width, else return content
+    width.
+
+    """
+    fixed = min_max(box, width)
+
+    if outer:
+        return margin_width(box, fixed, left, right)
+    else:
+        return fixed
 
 
-def block_preferred_width(context, box, outer=True):
-    """Return the preferred width for a ``BlockBox``."""
-    return _block_preferred_width(context, box, preferred_width, outer)
+def block_min_content_width(context, box, outer=True):
+    """Return the min-content width for a ``BlockBox``."""
+    return _block_content_width(
+        context, box, min_content_width, outer)
 
 
-def table_cell_preferred_minimum_width(context, box, table,
-                                       resolved_table_width, outer=True):
-    """Return the preferred minimum width for a ``TableCellBox``."""
-    # Try to solve the cell's width if it is a percentage
-    width = box.style.width
-    if (resolved_table_width and table.width != 'auto' and
-            width != 'auto' and width.unit == '%'):
-        return width.value / 100. * table.width
-
-    # Else return standard block's preferred minimum width
-    return _block_preferred_width(
-        context, box, preferred_minimum_width, outer)
+def block_max_content_width(context, box, outer=True):
+    """Return the max-content width for a ``BlockBox``."""
+    return _block_content_width(context, box, max_content_width, outer)
 
 
-def table_cell_preferred_width(context, box, table, resolved_table_width,
-                               outer=True):
-    """Return the preferred width for a ``TableCellBox``."""
-    # Try to solve the cell's width if it is a percentage
-    width = box.style.width
-    if (resolved_table_width and table.width != 'auto' and
-            width != 'auto' and width.unit == '%'):
-        return width.value / 100. * table.width
-
-    # Else return standard block's preferred width
-    return _block_preferred_width(context, box, preferred_width, outer)
-
-
-def inline_preferred_minimum_width(context, box, outer=True, skip_stack=None,
-                                   first_line=False, is_line_start=False):
-    """Return the preferred minimum width for an ``InlineBox``.
+def inline_min_content_width(context, box, outer=True, skip_stack=None,
+                             first_line=False, is_line_start=False):
+    """Return the min-content width for an ``InlineBox``.
 
     The width is calculated from the lines from ``skip_stack``. If
     ``first_line`` is ``True``, only the first line minimum width is
     calculated.
 
     """
-    widths = list(inline_line_widths(
+    widths = inline_line_widths(
         context, box, outer, is_line_start, minimum=True,
-        skip_stack=skip_stack))
+        skip_stack=skip_stack, first_line=first_line)
 
-    if first_line and len(widths) > 1:
-        del widths[1:]
+    if first_line:
+        widths = [next(widths)]
     else:
+        widths = list(widths)
         widths[-1] -= trailing_whitespace_size(context, box)
     return adjust(box, outer, max(widths))
 
 
-def inline_preferred_width(context, box, outer=True, is_line_start=False):
-    """Return the preferred width for an ``InlineBox``."""
+def inline_max_content_width(context, box, outer=True, is_line_start=False):
+    """Return the max-content width for an ``InlineBox``."""
     widths = list(
         inline_line_widths(context, box, outer, is_line_start, minimum=False))
     widths[-1] -= trailing_whitespace_size(context, box)
     return adjust(box, outer, max(widths))
 
 
+def column_group_content_width(context, box):
+    """Return the *-content width for an ``TableColumnGroupBox``."""
+    width = box.style['width']
+    if width == 'auto' or width.unit == '%':
+        width = 0
+    else:
+        assert width.unit == 'px'
+        width = width.value
+
+    return adjust(box, False, width)
+
+
 def inline_line_widths(context, box, outer, is_line_start, minimum,
-                       skip_stack=None):
+                       skip_stack=None, first_line=False):
+    if box.style['text_indent'].unit == '%':
+        # TODO: this is wrong, text-indent percentages should be resolved
+        # before calling this function.
+        text_indent = 0
+    else:
+        text_indent = box.style['text_indent'].value
     current_line = 0
     if skip_stack is None:
         skip = 0
@@ -216,28 +235,48 @@ def inline_line_widths(context, box, outer, is_line_start, minimum,
             continue  # Skip
 
         if isinstance(child, boxes.InlineBox):
-            lines = list(inline_line_widths(
-                context, child, outer, is_line_start, minimum, skip_stack))
+            lines = inline_line_widths(
+                context, child, outer, is_line_start, minimum, skip_stack,
+                first_line)
+            if first_line:
+                lines = [next(lines)]
+            else:
+                lines = list(lines)
             if len(lines) == 1:
                 lines[0] = adjust(child, outer, lines[0])
             else:
                 lines[0] = adjust(child, outer, lines[0], right=False)
                 lines[-1] = adjust(child, outer, lines[-1], left=False)
         elif isinstance(child, boxes.TextBox):
+            space_collapse = child.style['white_space'] in (
+                'normal', 'nowrap', 'pre-line')
             if skip_stack is None:
                 skip = 0
             else:
                 skip, skip_stack = skip_stack
                 assert skip_stack is None
             child_text = child.text[(skip or 0):]
-            if is_line_start:
+            if is_line_start and space_collapse:
                 child_text = child_text.lstrip(' ')
             if minimum and child_text == ' ':
                 lines = [0, 0]
             else:
-                lines = list(text.line_widths(
-                    child_text, child.style, context.enable_hinting,
-                    width=0 if minimum else None))
+                max_width = 0 if minimum else None
+                lines = []
+                resume_at = new_resume_at = 0
+                while new_resume_at is not None:
+                    resume_at += new_resume_at
+                    _, _, new_resume_at, width, _, _ = (
+                        text.split_first_line(
+                            child_text[resume_at:], child.style, context,
+                            max_width, child.justification_spacing,
+                            minimum=True))
+                    lines.append(width)
+                    if first_line:
+                        break
+                if first_line and new_resume_at:
+                    current_line += lines[0]
+                    break
         else:
             # http://www.w3.org/TR/css3-text/#line-break-details
             # "The line breaking behavior of a replaced element
@@ -247,251 +286,403 @@ def inline_line_widths(context, box, outer, is_line_start, minimum,
             # "By default, there is a break opportunity
             #  both before and after any inline object."
             if minimum:
-                lines = [0, preferred_width(context, child), 0]
+                lines = [0, max_content_width(context, child), 0]
             else:
-                lines = [preferred_width(context, child)]
+                lines = [max_content_width(context, child)]
         # The first text line goes on the current line
         current_line += lines[0]
         if len(lines) > 1:
             # Forced line break
-            yield current_line
+            yield current_line + text_indent
+            text_indent = 0
             if len(lines) > 2:
                 for line in lines[1:-1]:
                     yield line
             current_line = lines[-1]
         is_line_start = lines[-1] == 0
         skip_stack = None
-    yield current_line
+    yield current_line + text_indent
 
 
-TABLE_CACHE = weakref.WeakKeyDictionary()
+def _percentage_contribution(box):
+    """Return the percentage contribution of a cell, column or column group.
 
-
-def table_and_columns_preferred_widths(context, box, outer=True,
-                                       resolved_table_width=False):
-    """Return preferred widths for the table and its columns.
-
-    If ``resolved_table_width`` is ``True``, the resolved width (instead of the
-    one given in ``box.style``) is used to get the preferred widths.
-
-    The tuple returned is
-    ``(table_preferred_minimum_width, table_preferred_width,
-    column_preferred_minimum_widths, column_preferred_widths)``
-
-    http://www.w3.org/TR/CSS21/tables.html#auto-table-layout
+    http://dbaron.org/css/intrinsic/#pct-contrib
 
     """
+    min_width = (
+        box.style['min_width'].value if box.style['min_width'] != 'auto' and
+        box.style['min_width'].unit == '%' else 0)
+    max_width = (
+        box.style['max_width'].value if box.style['max_width'] != 'auto' and
+        box.style['max_width'].unit == '%' else float('inf'))
+    width = (
+        box.style['width'].value if box.style['width'] != 'auto' and
+        box.style['width'].unit == '%' else 0)
+    return max(min_width, min(width, max_width))
+
+
+def table_and_columns_preferred_widths(context, box, outer=True):
+    """Return content widths for the auto layout table and its columns.
+
+    The tuple returned is
+    ``(table_min_content_width, table_max_content_width,
+       column_min_content_widths, column_max_content_widths,
+       column_intrinsic_percentages, constrainedness,
+       total_horizontal_border_spacing, grid)``
+
+    http://dbaron.org/css/intrinsic/
+
+    """
+    # Avoid a circular import
+    from .tables import distribute_excess_width
+
     table = box.get_wrapped_table()
-    result = TABLE_CACHE.get(table)
+    result = context.tables.get(table)
     if result:
-        return result
+        return result[outer]
 
-    if table.style.border_collapse == 'separate':
-        border_spacing_x, _ = table.style.border_spacing
+    # Create the grid
+    grid_width, grid_height = 0, 0
+    row_number = 0
+    for row_group in table.children:
+        for row in row_group.children:
+            for cell in row.children:
+                grid_width = max(cell.grid_x + cell.colspan, grid_width)
+                grid_height = max(row_number + cell.rowspan, grid_height)
+            row_number += 1
+    grid = [[None] * grid_width for i in range(grid_height)]
+    row_number = 0
+    for row_group in table.children:
+        for row in row_group.children:
+            for cell in row.children:
+                grid[row_number][cell.grid_x] = cell
+            row_number += 1
+
+    zipped_grid = list(zip(*grid))
+
+    # Define the total horizontal border spacing
+    if table.style['border_collapse'] == 'separate' and grid_width > 0:
+        total_horizontal_border_spacing = (
+            table.style['border_spacing'][0] *
+            (1 + len([column for column in zipped_grid if any(column)])))
     else:
-        border_spacing_x = 0
+        total_horizontal_border_spacing = 0
 
-    nb_columns = 0
-    if table.column_groups:
-        last_column_group = table.column_groups[-1]
-        # Column groups always have at least one child column.
-        last_column = last_column_group.children[-1]
-        # +1 as the grid starts at 0
-        nb_columns = last_column.grid_x + 1
+    if grid_width == 0 or grid_height == 0:
+        table.children = []
+        min_width = block_min_content_width(context, table, outer=False)
+        max_width = block_max_content_width(context, table, outer=False)
+        outer_min_width = adjust(
+            box, outer=True, width=block_min_content_width(
+                context, table, outer=True))
+        outer_max_width = adjust(
+            box, outer=True, width=block_max_content_width(
+                context, table, outer=True))
+        result = ([], [], [], [], total_horizontal_border_spacing, [])
+        context.tables[table] = result = {
+            False: (min_width, max_width) + result,
+            True: (outer_min_width, outer_max_width) + result,
+        }
+        return result[outer]
 
-    rows = []
-    for i, row_group in enumerate(table.children):
-        for j, row in enumerate(row_group.children):
-            rows.append(row)
-            if row.children:
-                last_cell = row.children[-1]
-                row_grid_width = last_cell.grid_x + last_cell.colspan
-                nb_columns = max(nb_columns, row_grid_width)
-    nb_rows = len(rows)
+    column_groups = [None] * grid_width
+    columns = [None] * grid_width
+    column_number = 0
+    for column_group in table.column_groups:
+        for column in column_group.children:
+            column_groups[column_number] = column_group
+            columns[column_number] = column
+            column_number += 1
+            if column_number == grid_width:
+                break
+        else:
+            continue
+        break
 
     colspan_cells = []
-    grid = [[None] * nb_columns for i in range(nb_rows)]
-    for i, row in enumerate(rows):
-        for cell in row.children:
-            if cell.colspan == 1:
-                grid[i][cell.grid_x] = cell
-            else:
-                cell.grid_y = i
-                colspan_cells.append(cell)
 
-    # Point #1
-    column_preferred_widths = [[0] * nb_rows for i in range(nb_columns)]
-    column_preferred_minimum_widths = [
-        [0] * nb_rows for i in range(nb_columns)]
-    for i, row in enumerate(grid):
-        for j, cell in enumerate(row):
+    # Define the intermediate content widths
+    min_content_widths = [0 for i in range(grid_width)]
+    max_content_widths = [0 for i in range(grid_width)]
+    intrinsic_percentages = [0 for i in range(grid_width)]
+
+    # Intermediate content widths for span 1
+    for i in range(grid_width):
+        for groups in (column_groups, columns):
+            if groups[i]:
+                min_content_widths[i] = max(
+                    min_content_widths[i],
+                    min_content_width(context, groups[i]))
+                max_content_widths[i] = max(
+                    max_content_widths[i],
+                    max_content_width(context, groups[i]))
+                intrinsic_percentages[i] = max(
+                    intrinsic_percentages[i],
+                    _percentage_contribution(groups[i]))
+        for cell in zipped_grid[i]:
             if cell:
-                column_preferred_widths[j][i] = \
-                    table_cell_preferred_width(
-                        context, cell, table, resolved_table_width)
-                column_preferred_minimum_widths[j][i] = \
-                    table_cell_preferred_minimum_width(
-                        context, cell, table, resolved_table_width)
+                if cell.colspan == 1:
+                    min_content_widths[i] = max(
+                        min_content_widths[i],
+                        min_content_width(context, cell))
+                    max_content_widths[i] = max(
+                        max_content_widths[i],
+                        max_content_width(context, cell))
+                    intrinsic_percentages[i] = max(
+                        intrinsic_percentages[i],
+                        _percentage_contribution(cell))
+                else:
+                    colspan_cells.append(cell)
 
-    column_preferred_widths = [
-        max(widths) if widths else 0
-        for widths in column_preferred_widths]
-    column_preferred_minimum_widths = [
-        max(widths) if widths else 0
-        for widths in column_preferred_minimum_widths]
+    # Intermediate content widths for span > 1 is wrong in the 4.1 section, as
+    # explained in its third issue. Min- and max-content widths are handled by
+    # the excess width distribution method, and percentages do not distribute
+    # widths to columns that have originating cells.
 
-    # Point #2
-    column_groups_widths = []
-    column_widths = [None] * nb_columns
-    for column_group in table.column_groups:
-        assert isinstance(column_group, boxes.TableColumnGroupBox)
-        column_groups_widths.append((column_group, column_group.style.width))
-        for column in column_group.children:
-            assert isinstance(column, boxes.TableColumnBox)
-            column_widths[column.grid_x] = column.style.width
+    # Intermediate intrinsic percentage widths for span > 1
+    for span in range(1, grid_width):
+        percentage_contributions = []
+        for i in range(grid_width):
+            percentage_contribution = intrinsic_percentages[i]
+            for j, cell in enumerate(zipped_grid[i]):
+                indexes = [k for k in range(i + 1) if grid[j][k]]
+                if not indexes:
+                    continue
+                origin = max(indexes)
+                origin_cell = grid[j][origin]
+                if origin_cell.colspan - 1 != span:
+                    continue
+                cell_slice = slice(origin, origin + origin_cell.colspan)
+                baseline_percentage = sum(intrinsic_percentages[cell_slice])
 
-    if column_widths:
-        for widths in (column_preferred_widths,
-                       column_preferred_minimum_widths):
-            for i, width in enumerate(widths):
-                column_width = column_widths[i]
-                if column_width and column_width != 'auto':
-                    if column_width.unit == '%' and resolved_table_width:
-                        # TODO: If resolved_table_width is false, we should try
-                        # to use this percentage as a constraint
-                        widths[i] = max(
-                            column_width.value / 100. * table.width, widths[i])
-                    elif column_width.unit != '%':
-                        widths[i] = max(column_width.value, widths[i])
+                # Cell contribution to intrinsic percentage width
+                if intrinsic_percentages[i] == 0:
+                    diff = max(
+                        0,
+                        _percentage_contribution(origin_cell) -
+                        baseline_percentage)
+                    other_columns_contributions = [
+                        max_content_widths[j]
+                        for j in range(
+                            origin, origin + origin_cell.colspan)
+                        if intrinsic_percentages[j] == 0]
+                    other_columns_contributions_sum = sum(
+                        other_columns_contributions)
+                    if other_columns_contributions_sum == 0:
+                        ratio = 1 / len(other_columns_contributions)
+                    else:
+                        ratio = (
+                            max_content_widths[i] /
+                            other_columns_contributions_sum)
+                    percentage_contribution = max(
+                        percentage_contribution,
+                        diff * ratio)
 
-    # Point #3
+            percentage_contributions.append(percentage_contribution)
+
+        intrinsic_percentages = percentage_contributions
+
+    # Define constrainedness
+    constrainedness = [False for i in range(grid_width)]
+    for i in range(grid_width):
+        if (column_groups[i] and column_groups[i].style['width'] != 'auto' and
+                column_groups[i].style['width'].unit != '%'):
+            constrainedness[i] = True
+            continue
+        if (columns[i] and columns[i].style['width'] != 'auto' and
+                columns[i].style['width'].unit != '%'):
+            constrainedness[i] = True
+            continue
+        for cell in zipped_grid[i]:
+            if (cell and cell.colspan == 1 and
+                    cell.style['width'] != 'auto' and
+                    cell.style['width'].unit != '%'):
+                constrainedness[i] = True
+                break
+
+    intrinsic_percentages = [
+        min(percentage, 100 - sum(intrinsic_percentages[:i]))
+        for i, percentage in enumerate(intrinsic_percentages)]
+
+    # Max- and min-content widths for span > 1
     for cell in colspan_cells:
+        min_content = min_content_width(context, cell)
+        max_content = max_content_width(context, cell)
         column_slice = slice(cell.grid_x, cell.grid_x + cell.colspan)
-
-        cell_width = (
-            table_cell_preferred_width(
-                context, cell, table, resolved_table_width) -
-            border_spacing_x * (cell.colspan - 1))
-        columns_width = sum(column_preferred_widths[column_slice])
-        if cell_width > columns_width:
-            added_space = (cell_width - columns_width) / cell.colspan
-            for i in range(cell.grid_x, cell.grid_x + cell.colspan):
-                column_preferred_widths[i] += added_space
-
-        cell_minimum_width = (
-            table_cell_preferred_minimum_width(
-                context, cell, table, resolved_table_width) -
-            border_spacing_x * (cell.colspan - 1))
-        columns_minimum_width = sum(
-            column_preferred_minimum_widths[column_slice])
-        if cell_minimum_width > columns_minimum_width:
-            added_space = (
-                (cell_minimum_width - columns_minimum_width) / cell.colspan)
-            for i in range(cell.grid_x, cell.grid_x + cell.colspan):
-                column_preferred_minimum_widths[i] += added_space
-
-    # Point #4
-    for column_group, column_group_width in column_groups_widths:
-        if (column_group_width and column_group_width != 'auto' and
-                (column_group_width.unit != '%' or resolved_table_width)):
-            column_indexes = [
-                column.grid_x for column in column_group.children]
-            columns_width = sum(
-                column_preferred_minimum_widths[index]
-                for index in column_indexes)
-            if column_group_width.unit == '%':
-                column_group_width = (
-                    column_group_width.value / 100. * table.width)
-            else:
-                column_group_width = column_group_width.value
-            if column_group_width > columns_width:
-                added_space = (
-                    (column_group_width - columns_width) / len(column_indexes))
-                for i in column_indexes:
-                    column_preferred_minimum_widths[i] += added_space
-                    # The spec seems to say that the colgroup's width is just a
-                    # hint for column group's columns minimum width, but if the
-                    # sum of the preferred maximum width of the colums is lower
-                    # or greater than the colgroup's one, then the columns
-                    # don't follow the hint. These lines make the preferred
-                    # width equal or greater than the minimum preferred width.
-                    if (column_preferred_widths[i] <
-                            column_preferred_minimum_widths[i]):
-                        column_preferred_widths[i] = \
-                            column_preferred_minimum_widths[i]
-
-    total_border_spacing = (nb_columns + 1) * border_spacing_x
-    table_preferred_minimum_width = (
-        sum(column_preferred_minimum_widths) + total_border_spacing)
-    table_preferred_width = sum(column_preferred_widths) + total_border_spacing
-
-    captions = [child for child in box.children
-                if child is not table and not child.is_absolutely_positioned()]
-
-    if captions:
-        caption_width = max(
-            preferred_minimum_width(context, caption) for caption in captions)
-    else:
-        caption_width = 0
-
-    if table.style.width != 'auto':
-        # Take care of the table width
-        if resolved_table_width:
-            if table.width > table_preferred_minimum_width:
-                table_preferred_minimum_width = table.width
+        columns_min_content = sum(min_content_widths[column_slice])
+        columns_max_content = sum(max_content_widths[column_slice])
+        if table.style['border_collapse'] == 'separate':
+            spacing = (cell.colspan - 1) * table.style['border_spacing'][0]
         else:
-            if (table.style.width.unit != '%' and
-                    table.style.width.value > table_preferred_minimum_width):
-                table_preferred_minimum_width = table.style.width.value
+            spacing = 0
 
-    if table_preferred_minimum_width < caption_width:
-        table_preferred_minimum_width = caption_width
+        if min_content > columns_min_content + spacing:
+            excess_width = min_content - (columns_min_content + spacing)
+            distribute_excess_width(
+                context, zipped_grid, excess_width, min_content_widths,
+                constrainedness, intrinsic_percentages, max_content_widths,
+                column_slice)
 
-    if table_preferred_minimum_width > table_preferred_width:
-        table_preferred_width = table_preferred_minimum_width
+        if max_content > columns_max_content + spacing:
+            excess_width = max_content - (columns_max_content + spacing)
+            distribute_excess_width(
+                context, zipped_grid, excess_width, max_content_widths,
+                constrainedness, intrinsic_percentages, max_content_widths,
+                column_slice)
+
+    # Calculate the max- and min-content widths of table and columns
+    small_percentage_contributions = [
+        max_content_widths[i] / (intrinsic_percentages[i] / 100.)
+        for i in range(grid_width)
+        if intrinsic_percentages[i]]
+    large_percentage_contribution_numerator = sum(
+        max_content_widths[i] for i in range(grid_width)
+        if intrinsic_percentages[i] == 0)
+    large_percentage_contribution_denominator = (
+        (100 - sum(intrinsic_percentages)) / 100.)
+    if large_percentage_contribution_denominator == 0:
+        if large_percentage_contribution_numerator == 0:
+            large_percentage_contribution = 0
+        else:
+            # "the large percentage contribution of the table [is] an
+            # infinitely large number if the numerator is nonzero [and] the
+            # denominator of that ratio is 0."
+            #
+            # http://dbaron.org/css/intrinsic/#autotableintrinsic
+            #
+            # Please note that "an infinitely large number" is not "infinite",
+            # and that's probably not a coincindence: putting 'inf' here breaks
+            # some cases (see #305).
+            large_percentage_contribution = sys.maxsize
+    else:
+        large_percentage_contribution = (
+            large_percentage_contribution_numerator /
+            large_percentage_contribution_denominator)
+
+    table_min_content_width = (
+        total_horizontal_border_spacing + sum(min_content_widths))
+    table_max_content_width = (
+        total_horizontal_border_spacing + max(
+            [sum(max_content_widths), large_percentage_contribution] +
+            small_percentage_contributions))
+
+    if table.style['width'] != 'auto' and table.style['width'].unit == 'px':
+        # "percentages on the following properties are treated instead as
+        # though they were the following: width: auto"
+        # http://dbaron.org/css/intrinsic/#outer-intrinsic
+        table_min_width = table_max_width = table.style['width'].value
+    else:
+        table_min_width = table_min_content_width
+        table_max_width = table_max_content_width
+
+    table_min_content_width = max(
+        table_min_content_width, adjust(
+            table, outer=False, width=table_min_width))
+    table_max_content_width = max(
+        table_max_content_width, adjust(
+            table, outer=False, width=table_max_width))
+    table_outer_min_content_width = margin_width(
+        table, margin_width(box, table_min_content_width))
+    table_outer_max_content_width = margin_width(
+        table, margin_width(box, table_max_content_width))
 
     result = (
-        table_preferred_minimum_width, table_preferred_width,
-        column_preferred_minimum_widths, column_preferred_widths)
-    TABLE_CACHE[table] = result
-    return result
+        min_content_widths, max_content_widths, intrinsic_percentages,
+        constrainedness, total_horizontal_border_spacing, zipped_grid)
+    context.tables[table] = result = {
+        False: (table_min_content_width, table_max_content_width) + result,
+        True: (
+            (table_outer_min_content_width, table_outer_max_content_width) +
+            result),
+    }
+    return result[outer]
 
 
-def table_preferred_minimum_width(context, box, outer=True):
-    """Return the preferred minimum width for a ``TableBox``. wrapper"""
-    resolved_table_width = box.style.width != 'auto'
-    minimum_width, _, _, _ = table_and_columns_preferred_widths(
-        context, box, resolved_table_width)
-    return adjust(box, outer, minimum_width)
-
-
-def table_preferred_width(context, box, outer=True):
-    """Return the preferred width for a ``TableBox`` wrapper."""
-    resolved_table_width = box.style.width != 'auto'
-    _, width, _, _ = table_and_columns_preferred_widths(
-        context, box, resolved_table_width)
+def replaced_min_content_width(box, outer=True):
+    """Return the min-content width for an ``InlineReplacedBox``."""
+    width = box.style['width']
+    if width == 'auto':
+        height = box.style['height']
+        if height == 'auto' or height.unit == '%':
+            height = 'auto'
+        else:
+            assert height.unit == 'px'
+            height = height.value
+        if (box.style['max_width'] != 'auto' and
+                box.style['max_width'].unit == '%'):
+            # See https://drafts.csswg.org/css-sizing/#intrinsic-contribution
+            width = 0
+        else:
+            image = box.replacement
+            iwidth, iheight = image.get_intrinsic_size(
+                box.style['image_resolution'], box.style['font_size'])
+            width, _ = default_image_sizing(
+                iwidth, iheight, image.intrinsic_ratio, 'auto', height,
+                default_width=300, default_height=150)
+    elif box.style['width'].unit == '%':
+        # See https://drafts.csswg.org/css-sizing/#intrinsic-contribution
+        width = 0
+    else:
+        assert width.unit == 'px'
+        width = width.value
     return adjust(box, outer, width)
 
 
-def replaced_preferred_width(box, outer=True):
-    """Return the preferred minimum width for an ``InlineReplacedBox``."""
-    width = box.style.width
-    if width == 'auto' or width.unit == '%':
-        height = box.style.height
+def replaced_max_content_width(box, outer=True):
+    """Return the max-content width for an ``InlineReplacedBox``."""
+    width = box.style['width']
+    if width == 'auto':
+        height = box.style['height']
         if height == 'auto' or height.unit == '%':
             height = 'auto'
         else:
             assert height.unit == 'px'
             height = height.value
         image = box.replacement
-        iwidth, iheight = image.get_intrinsic_size(box.style.image_resolution)
+        iwidth, iheight = image.get_intrinsic_size(
+            box.style['image_resolution'], box.style['font_size'])
         width, _ = default_image_sizing(
             iwidth, iheight, image.intrinsic_ratio, 'auto', height,
             default_width=300, default_height=150)
+    elif box.style['width'].unit == '%':
+        # See https://drafts.csswg.org/css-sizing/#intrinsic-contribution
+        width = 0
     else:
         assert width.unit == 'px'
         width = width.value
     return adjust(box, outer, width)
+
+
+def flex_min_content_width(context, box, outer=True):
+    """Return the min-content width for an ``FlexContainerBox``."""
+    # TODO: use real values, see
+    # https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes
+    min_contents = [
+        min_content_width(context, child, outer=True)
+        for child in box.children if child.is_flex_item]
+    if not min_contents:
+        return adjust(box, outer, 0)
+    if (box.style['flex_direction'].startswith('row') and
+            box.style['flex_wrap'] == 'nowrap'):
+        return adjust(box, outer, sum(min_contents))
+    else:
+        return adjust(box, outer, max(min_contents))
+
+
+def flex_max_content_width(context, box, outer=True):
+    """Return the max-content width for an ``FlexContainerBox``."""
+    # TODO: use real values, see
+    # https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes
+    max_contents = [
+        max_content_width(context, child, outer=True)
+        for child in box.children if child.is_flex_item]
+    if not max_contents:
+        return adjust(box, outer, 0)
+    if box.style['flex_direction'].startswith('row'):
+        return adjust(box, outer, sum(max_contents))
+    else:
+        return adjust(box, outer, max(max_contents))
 
 
 def trailing_whitespace_size(context, box):
@@ -503,22 +694,21 @@ def trailing_whitespace_size(context, box):
             return 0
         box = box.children[-1]
     if not (isinstance(box, boxes.TextBox) and box.text and
-            box.style.white_space in ('normal', 'nowrap', 'pre-line')):
+            box.style['white_space'] in ('normal', 'nowrap', 'pre-line')):
         return 0
     stripped_text = box.text.rstrip(' ')
-    if box.style.font_size == 0 or len(stripped_text) == len(box.text):
+    if box.style['font_size'] == 0 or len(stripped_text) == len(box.text):
         return 0
     if stripped_text:
-        old_box, _, _ = split_text_box(context, box, None, None, 0)
+        old_box, _, _ = split_text_box(context, box, None, 0)
         assert old_box
         stripped_box = box.copy_with_text(stripped_text)
         stripped_box, resume, _ = split_text_box(
-            context, stripped_box, None, None, 0)
+            context, stripped_box, None, 0)
         assert stripped_box is not None
         assert resume is None
         return old_box.width - stripped_box.width
     else:
         _, _, _, width, _, _ = split_first_line(
-            box.text, box.style, context.enable_hinting,
-            None, None)
+            box.text, box.style, context, None, box.justification_spacing)
         return width

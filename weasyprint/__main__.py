@@ -1,22 +1,19 @@
-# coding: utf8
 """
     weasyprint.__main__
     -------------------
 
     Command-line interface to WeasyPrint.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-# No __future__.unicode_literals here.
-# Native strings are fine with argparse, unicode makes --help crash on 2.6.
-
-import sys
 import argparse
+import logging
+import sys
 
-from . import VERSION, HTML
+from . import HTML, LOGGER, VERSION
 
 
 def main(argv=None, stdout=None, stdin=None):
@@ -29,23 +26,23 @@ def main(argv=None, stdout=None, stdin=None):
     The input is a filename or URL to an HTML document, or ``-`` to read
     HTML from stdin. The output is a filename, or ``-`` to write to stdout.
 
-    Options can be mixed anywhere before, between or after the input and
+    Options can be mixed anywhere before, between, or after the input and
     output:
 
     .. option:: -e <input_encoding>, --encoding <input_encoding>
 
-        Force the input character encoding (eg. ``-e utf8``).
+        Force the input character encoding (e.g. ``-e utf8``).
 
     .. option:: -f <output_format>, --format <output_format>
 
-        Choose the output file format among PDF and PNG (eg. ``-f png``).
+        Choose the output file format among PDF and PNG (e.g. ``-f png``).
         Required if the output is not a ``.pdf`` or ``.png`` filename.
 
     .. option:: -s <filename_or_URL>, --stylesheet <filename_or_URL>
 
         Filename or URL of a user CSS stylesheet (see
-        :ref:`stylesheet-origins`\.) to add to the document.
-        (eg. ``-s print.css``). Multiple stylesheets are allowed.
+        :ref:`stylesheet-origins`) to add to the document
+        (e.g. ``-s print.css``). Multiple stylesheets are allowed.
 
     .. option:: -r <dpi>, --resolution <dpi>
 
@@ -63,8 +60,13 @@ def main(argv=None, stdout=None, stdin=None):
 
     .. option:: -a <file>, --attachment <file>
 
-        Adds an attachment to the document which is included in the PDF output.
-        This option can be added multiple times to attach more files.
+        Adds an attachment to the document.  The attachment is
+        included in the PDF output.  This option can be used multiple
+        times.
+
+    .. option:: -p, --presentational-hints
+
+        Follow HTML presentational hints.
 
     .. option:: --version
 
@@ -83,7 +85,7 @@ def main(argv=None, stdout=None, stdin=None):
     parser.add_argument('-e', '--encoding',
                         help='Character encoding of the input')
     parser.add_argument('-f', '--format', choices=['pdf', 'png'],
-                        help='Output format. Can be ommited if `output` '
+                        help='Output format. Can be omitted if `output` '
                              'ends with a .pdf or .png extension.')
     parser.add_argument('-s', '--stylesheet', action='append',
                         help='URL or filename for a user CSS stylesheet. '
@@ -100,6 +102,10 @@ def main(argv=None, stdout=None, stdin=None):
     parser.add_argument('-a', '--attachment', action='append',
                         help='URL or filename of a file '
                              'to attach to the PDF document')
+    parser.add_argument('-p', '--presentational-hints', action='store_true',
+                        help='Follow HTML presentational hints.')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show various debugging information.')
     parser.add_argument(
         'input', help='URL or filename of the HTML input, or - for stdin')
     parser.add_argument(
@@ -115,7 +121,7 @@ def main(argv=None, stdout=None, stdin=None):
             format_ = 'png'
         else:
             parser.error(
-                'Either sepecify a format with -f or choose an '
+                'Either specify a format with -f or choose an '
                 'output filename that ends in .pdf or .png')
     else:
         format_ = args.format.lower()
@@ -125,8 +131,10 @@ def main(argv=None, stdout=None, stdin=None):
             stdin = sys.stdin
         # stdin.buffer on Py3, stdin on Py2
         source = getattr(stdin, 'buffer', stdin)
-        if not args.base_url:
+        if args.base_url is None:
             args.base_url = '.'  # current directory
+        elif args.base_url == '':
+            args.base_url = None  # no base URL
     else:
         source = args.input
 
@@ -138,7 +146,9 @@ def main(argv=None, stdout=None, stdin=None):
     else:
         output = args.output
 
-    kwargs = {'stylesheets': args.stylesheet}
+    kwargs = {
+        'stylesheets': args.stylesheet,
+        'presentational_hints': args.presentational_hints}
     if args.resolution:
         if format_ == 'png':
             kwargs['resolution'] = args.resolution
@@ -147,9 +157,16 @@ def main(argv=None, stdout=None, stdin=None):
 
     if args.attachment:
         if format_ == 'pdf':
-            kwargs['attachments'] = args.attachments
+            kwargs['attachments'] = args.attachment
         else:
             parser.error('--attachment only applies for the PDF format.')
+
+    # Default to logging to stderr.
+    if args.verbose:
+        LOGGER.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    LOGGER.addHandler(handler)
 
     html = HTML(source, base_url=args.base_url, encoding=args.encoding,
                 media_type=args.media_type)

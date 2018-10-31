@@ -1,4 +1,3 @@
-# coding: utf8
 """
     weasyprint.formatting_structure.build
     -------------------------------------
@@ -9,23 +8,20 @@
     This includes creating anonymous boxes and processing whitespace
     as necessary.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
-
+import copy
 import re
+import unicodedata
 
-from tinycss.color3 import COLOR_KEYWORDS
+import tinycss2.color3
 
 from . import boxes, counters
 from .. import html
 from ..css import properties
-from ..css.computed_values import ZERO_PIXELS
-from ..compat import basestring, xrange
-
 
 # Maps values of the ``display`` CSS property to box types.
 BOX_TYPE_FROM_DISPLAY = {
@@ -43,12 +39,17 @@ BOX_TYPE_FROM_DISPLAY = {
     'table-column-group': boxes.TableColumnGroupBox,
     'table-cell': boxes.TableCellBox,
     'table-caption': boxes.TableCaptionBox,
+    'flex': boxes.FlexBox,
+    'inline-flex': boxes.InlineFlexBox,
 }
 
 
-def build_formatting_structure(element_tree, style_for, get_image_from_uri):
+def build_formatting_structure(element_tree, style_for, get_image_from_uri,
+                               base_url, target_collector):
     """Build a formatting structure (box tree) from an element tree."""
-    box_list = element_to_box(element_tree, style_for, get_image_from_uri)
+    box_list = element_to_box(
+        element_tree, style_for, get_image_from_uri, base_url,
+        target_collector)
     if box_list:
         box, = box_list
     else:
@@ -56,38 +57,36 @@ def build_formatting_structure(element_tree, style_for, get_image_from_uri):
         def root_style_for(element, pseudo_type=None):
             style = style_for(element, pseudo_type)
             if style:
-                if element.getparent() is None:
-                    style.display = 'block'
+                # TODO: we should check that the element has a parent instead.
+                if element.tag == 'html':
+                    style['display'] = 'block'
                 else:
-                    style.display = 'none'
+                    style['display'] = 'none'
             return style
-        box, = element_to_box(element_tree, root_style_for, get_image_from_uri)
+        box, = element_to_box(
+            element_tree, root_style_for, get_image_from_uri, base_url,
+            target_collector)
+
+    target_collector.check_pending_targets()
+
     box.is_for_root_element = True
     # If this is changed, maybe update weasy.layout.pages.make_margin_boxes()
     process_whitespace(box)
     box = anonymous_table_boxes(box)
+    box = flex_boxes(box)
     box = inline_in_block(box)
     box = block_in_inline(box)
     box = set_viewport_overflow(box)
     return box
 
 
-def make_box(element_tag, sourceline, style, content, get_image_from_uri):
-    if (style.display in ('table', 'inline-table')
-            and style.border_collapse == 'collapse'):
-        # Padding do not apply
-        for side in ['top', 'bottom', 'left', 'right']:
-            style['padding_' + side] = ZERO_PIXELS
-    if style.display.startswith('table-') and style.display != 'table-caption':
-        # Margins do not apply
-        for side in ['top', 'bottom', 'left', 'right']:
-            style['margin_' + side] = ZERO_PIXELS
-
-    return BOX_TYPE_FROM_DISPLAY[style.display](element_tag, sourceline,
-                                                style, content)
+def make_box(element_tag, style, content, get_image_from_uri):
+    return BOX_TYPE_FROM_DISPLAY[style['display']](
+        element_tag, style, content)
 
 
-def element_to_box(element, style_for, get_image_from_uri, state=None):
+def element_to_box(element, style_for, get_image_from_uri, base_url,
+                   target_collector, state=None):
     """Convert an element and its children into a box with children.
 
     Return a list of boxes. Most of the time the list will have one item but
@@ -111,21 +110,19 @@ def element_to_box(element, style_for, get_image_from_uri, state=None):
     See http://www.w3.org/TR/CSS21/visuren.html#anonymous
 
     """
-    if not isinstance(element.tag, basestring):
-        # lxml.html already converts HTML entities to text.
-        # Here we ignore comments and XML processing instructions.
+    if not isinstance(element.tag, str):
+        # We ignore comments and XML processing instructions.
         return []
 
     style = style_for(element)
 
     # TODO: should be the used value. When does the used value for `display`
     # differ from the computer value?
-    display = style.display
+    display = style['display']
     if display == 'none':
         return []
 
-    box = make_box(element.tag, element.sourceline, style, [],
-                   get_image_from_uri)
+    box = make_box(element.tag, style, [], get_image_from_uri)
 
     if state is None:
         # use a list to have a shared mutable object
@@ -148,15 +145,27 @@ def element_to_box(element, style_for, get_image_from_uri, state=None):
     # names will be in this new list
     counter_scopes.append(set())
 
-    children.extend(pseudo_to_box(
-        element, 'before', state, style_for, get_image_from_uri))
+    box.first_letter_style = style_for(element, 'first-letter')
+    box.first_line_style = style_for(element, 'first-line')
+
+    children.extend(before_after_to_box(
+        element, 'before', state, style_for, get_image_from_uri,
+        target_collector))
+
+    # collect anchor's counter_values, maybe it's a target.
+    # to get the spec-conform counter_valuse we must do it here,
+    # after the ::before is parsed and befor the ::after is
+    if style['anchor']:
+        target_collector.store_target(style['anchor'], counter_values, box)
+
     text = element.text
     if text:
         children.append(boxes.TextBox.anonymous_from(box, text))
 
     for child_element in element:
         children.extend(element_to_box(
-            child_element, style_for, get_image_from_uri, state))
+            child_element, style_for, get_image_from_uri, base_url,
+            target_collector, state))
         text = child_element.tail
         if text:
             text_box = boxes.TextBox.anonymous_from(box, text)
@@ -164,8 +173,9 @@ def element_to_box(element, style_for, get_image_from_uri, state=None):
                 children[-1].text += text_box.text
             else:
                 children.append(text_box)
-    children.extend(pseudo_to_box(
-        element, 'after', state, style_for, get_image_from_uri))
+    children.extend(before_after_to_box(
+        element, 'after', state, style_for, get_image_from_uri,
+        target_collector))
 
     # Scopes created by this element’s children stop here.
     for name in counter_scopes.pop():
@@ -173,134 +183,352 @@ def element_to_box(element, style_for, get_image_from_uri, state=None):
         if not counter_values[name]:
             counter_values.pop(name)
 
-    box = box.copy_with_children(children)
-    replace_content_lists(element, box, style, counter_values)
+    box.children = children
+    # calculate string-set and bookmark-label
+    set_content_lists(element, box, style, counter_values, target_collector)
 
     # Specific handling for the element. (eg. replaced element)
-    return html.handle_element(element, box, get_image_from_uri)
+    return html.handle_element(element, box, get_image_from_uri, base_url)
 
 
-def pseudo_to_box(element, pseudo_type, state, style_for, get_image_from_uri):
-    """Yield the box for a :before or :after pseudo-element if there is one."""
+def before_after_to_box(element, pseudo_type, state, style_for,
+                        get_image_from_uri, target_collector):
+    """Yield the box for ::before or ::after pseudo-element if there is one."""
     style = style_for(element, pseudo_type)
     if pseudo_type and style is None:
-        # Pseudo-elements with no style at all do not get a StyleDict
+        # Pseudo-elements with no style at all do not get a style dict.
         # Their initial content property computes to 'none'.
         return
 
-    # TODO: should be the used value. When does the used value for `display`
-    # differ from the computer value?
-    display = style.display
-    content = style.content
-    if 'none' in (display, content) or content == 'normal':
+    # TODO: should be the computed value. When does the used value for
+    # `display` differ from the computer value? It's at least wrong for
+    # `content` where 'normal' computes as 'inhibit' for pseudo elements.
+    display = style['display']
+    content = style['content']
+    if 'none' in (display, content) or content in ('normal', 'inhibit'):
         return
 
     box = make_box(
-        '%s:%s' % (element.tag, pseudo_type), element.sourceline, style, [],
-        get_image_from_uri)
+        '%s::%s' % (element.tag, pseudo_type), style, [], get_image_from_uri)
 
     quote_depth, counter_values, _counter_scopes = state
     update_counters(state, style)
+
     children = []
     if display == 'list-item':
         children.extend(add_box_marker(
             box, counter_values, get_image_from_uri))
     children.extend(content_to_boxes(
-        style, box, quote_depth, counter_values, get_image_from_uri))
+        style, box, quote_depth, counter_values, get_image_from_uri,
+        target_collector))
 
-    yield box.copy_with_children(children)
+    box.children = children
+    yield box
 
 
-def content_to_boxes(style, parent_box, quote_depth, counter_values,
-                     get_image_from_uri, context=None):
-    """Takes the value of a ``content`` property and yield boxes."""
+def _collect_missing_counter(counter_name, counter_values, missing_counters):
+    """Collect missing counters."""
+    if counter_name not in list(counter_values) + missing_counters:
+        missing_counters.append(counter_name)
+
+
+def _collect_missing_target_counter(counter_name, lookup_counter_values,
+                                    anchor_name, missing_target_counters):
+    """Collect missing target counters.
+
+    The corresponding TargetLookupItem caches the target's page based
+    counter values during pagination.
+
+    """
+    if counter_name not in lookup_counter_values:
+        missing_counters = missing_target_counters.setdefault(anchor_name, [])
+        if counter_name not in missing_counters:
+            missing_counters.append(counter_name)
+
+
+def compute_content_list(content_list, parent_box, counter_values, css_token,
+                         parse_again, target_collector,
+                         get_image_from_uri=None, quote_depth=None,
+                         quote_style=None, context=None, page=None,
+                         element=None):
+    """Compute and return the boxes corresponding to the ``content_list``.
+
+    ``parse_again`` is called to compute the ``content_list`` again when
+    ``target_collector.lookup_target()`` detected a pending target.
+
+    ``build_formatting_structure`` calls
+    ``target_collector.check_pending_targets()`` after the first pass to do
+    required reparsing.
+
+    """
+    # TODO: Some computation done here may be done in computed_values
+    # instead. We currently miss at least style_for, counters and quotes
+    # context in computer. Some work will still need to be done here though,
+    # like box creation for URIs.
+    boxlist = []
     texts = []
-    for type_, value in style.content:
-        if type_ == 'STRING':
+
+    missing_counters = []
+    missing_target_counters = {}
+    in_page_context = context is not None and page is not None
+
+    # Collect missing counters during build_formatting_structure.
+    # Pointless to collect missing target counters in MarginBoxes.
+    need_collect_missing = target_collector.collecting and not in_page_context
+
+    # TODO: remove attribute or set a default value in Box class
+    if not hasattr(parent_box, 'cached_counter_values'):
+        # Store the counter_values in the parent_box to make them accessible
+        # in @page context. Obsoletes the parse_again function's deepcopy.
+        # TODO: Is propbably superfluous in_page_context.
+        parent_box.cached_counter_values = copy.deepcopy(counter_values)
+
+    for type_, value in content_list:
+        if type_ == 'string':
             texts.append(value)
-        elif type_ == 'URI':
-            image = get_image_from_uri(value)
+        elif type_ == 'url' and get_image_from_uri is not None:
+            origin, uri = value
+            if origin != 'external':
+                # Embedding internal references is impossible
+                continue
+            image = get_image_from_uri(uri)
             if image is not None:
                 text = ''.join(texts)
                 if text:
-                    yield boxes.TextBox.anonymous_from(parent_box, text)
+                    boxlist.append(
+                        boxes.TextBox.anonymous_from(parent_box, text))
                 texts = []
-                yield boxes.InlineReplacedBox.anonymous_from(parent_box, image)
-        elif type_ == 'counter':
+                boxlist.append(
+                    boxes.InlineReplacedBox.anonymous_from(parent_box, image))
+        elif type_ == 'content()':
+            added_text = TEXT_CONTENT_EXTRACTORS[value](parent_box)
+            # Simulate the step of white space processing
+            # (normally done during the layout)
+            added_text = added_text.strip()
+            texts.append(added_text)
+        elif type_ == 'counter()':
             counter_name, counter_style = value
+            if need_collect_missing:
+                _collect_missing_counter(
+                    counter_name, counter_values, missing_counters)
             counter_value = counter_values.get(counter_name, [0])[-1]
             texts.append(counters.format(counter_value, counter_style))
-        elif type_ == 'counters':
+        elif type_ == 'counters()':
             counter_name, separator, counter_style = value
+            if need_collect_missing:
+                _collect_missing_counter(
+                    counter_name, counter_values, missing_counters)
             texts.append(separator.join(
                 counters.format(counter_value, counter_style)
-                for counter_value in counter_values.get(counter_name, [0])
-            ))
-        elif type_ == 'string' and context is not None:
-            text = context.get_string_set_for(*value)
-            texts.append(text)
-        else:
-            assert type_ == 'QUOTE'
-            is_open, insert = value
+                for counter_value in counter_values.get(counter_name, [0])))
+        elif type_ == 'string()' and in_page_context:
+            # string() is only valid in @page context
+            texts.append(context.get_string_set_for(page, *value))
+        elif type_ == 'target-counter()':
+            anchor_token, counter_name, counter_style = value
+            lookup_target = target_collector.lookup_target(
+                anchor_token, parent_box, css_token, parse_again)
+            if lookup_target.state == 'up-to-date':
+                target_values = lookup_target.target_box.cached_counter_values
+                if need_collect_missing:
+                    _collect_missing_target_counter(
+                        counter_name, target_values,
+                        target_collector.anchor_name_from_token(anchor_token),
+                        missing_target_counters)
+                # Mixin target's cached page counters.
+                # cached_page_counter_values are empty during layout.
+                local_counters = (
+                    lookup_target.cached_page_counter_values.copy())
+                local_counters.update(target_values)
+                counter_value = local_counters.get(counter_name, [0])[-1]
+                texts.append(counters.format(counter_value, counter_style))
+            else:
+                texts = []
+                break
+        elif type_ == 'target-counters()':
+            anchor_token, counter_name, separator, counter_style = value
+            lookup_target = target_collector.lookup_target(
+                anchor_token, parent_box, css_token, parse_again)
+            if lookup_target.state == 'up-to-date':
+                if separator[0] != 'string':
+                    break
+                separator_string = separator[1]
+                target_values = lookup_target.target_box.cached_counter_values
+                if need_collect_missing:
+                    _collect_missing_target_counter(
+                        counter_name, target_values,
+                        target_collector.anchor_name_from_token(anchor_token),
+                        missing_target_counters)
+                # Mixin target's cached page counters.
+                # cached_page_counter_values are empty during layout.
+                local_counters = (
+                    lookup_target.cached_page_counter_values.copy())
+                local_counters.update(target_values)
+                texts.append(separator_string.join(
+                    counters.format(counter_value, counter_style)
+                    for counter_value in local_counters.get(
+                        counter_name, [0])))
+            else:
+                texts = []
+                break
+        elif type_ == 'target-text()':
+            anchor_token, text_style = value
+            lookup_target = target_collector.lookup_target(
+                anchor_token, parent_box, css_token, parse_again)
+            if lookup_target.state == 'up-to-date':
+                target_box = lookup_target.target_box
+                # TODO: 'before'- and 'after'- content referring missing
+                # counters are not properly set.
+                text = TEXT_CONTENT_EXTRACTORS[text_style](target_box)
+                # Simulate the step of white space processing
+                # (normally done during the layout)
+                texts.append(text.strip())
+            else:
+                texts = []
+                break
+        elif (type_ == 'quote' and
+                quote_depth is not None and
+                quote_style is not None):
+            is_open = 'open' in value
+            insert = not value.startswith('no-')
             if not is_open:
                 quote_depth[0] = max(0, quote_depth[0] - 1)
             if insert:
-                open_quotes, close_quotes = style.quotes
+                open_quotes, close_quotes = quote_style
                 quotes = open_quotes if is_open else close_quotes
                 texts.append(quotes[min(quote_depth[0], len(quotes) - 1)])
             if is_open:
                 quote_depth[0] += 1
     text = ''.join(texts)
     if text:
-        yield boxes.TextBox.anonymous_from(parent_box, text)
+        boxlist.append(boxes.TextBox.anonymous_from(parent_box, text))
+        # Only add CounterLookupItem if the content_list actually produced text
+        target_collector.collect_missing_counters(
+            parent_box, css_token, parse_again, missing_counters,
+            missing_target_counters)
+    return boxlist
 
 
-def compute_content_list_string(element, box, counter_values, content_list):
-    """Compute the string corresponding to the content-list."""
-    string = ''
-    for type_, value in content_list:
-        if type_ == 'STRING':
-            string += value
-        elif type_ == 'content':
-            added_text = TEXT_CONTENT_EXTRACTORS[value](box)
-            # Simulate the step of white space processing
-            # (normally done during the layout)
-            added_text = added_text.strip()
-            string += added_text
-        elif type_ == 'counter':
-            counter_name, counter_style = value
-            counter_value = counter_values.get(counter_name, [0])[-1]
-            string += counters.format(counter_value, counter_style)
-        elif type_ == 'counters':
-            counter_name, separator, counter_style = value
-            string += separator.join(
-                counters.format(counter_value, counter_style)
-                for counter_value
-                in counter_values.get(counter_name, [0]))
-        elif type_ == 'attr':
-            string += element.get(value, '')
-    return string
+def content_to_boxes(style, parent_box, quote_depth, counter_values,
+                     get_image_from_uri, target_collector, context=None,
+                     page=None):
+    """Take the value of a ``content`` property and return boxes."""
+    def parse_again(mixin_pagebased_counters=None):
+        """Closure to parse the ``parent_boxes`` children all again."""
+
+        # Neither alters the mixed-in nor the cached counter values, no
+        # need to deepcopy here
+        if mixin_pagebased_counters is None:
+            local_counters = {}
+        else:
+            local_counters = mixin_pagebased_counters.copy()
+        local_counters.update(parent_box.cached_counter_values)
+
+        local_children = []
+        if style['display'] == 'list-item':
+            local_children.extend(add_box_marker(
+                parent_box, local_counters, get_image_from_uri))
+        local_children.extend(content_to_boxes(
+            style, parent_box, orig_quote_depth, local_counters,
+            get_image_from_uri, target_collector))
+
+        # TODO: redo the formatting structure of the parent instead of hacking
+        # the already formatted structure. Find why inline_in_blocks has
+        # sometimes already been called, and sometimes not.
+        if (len(parent_box.children) == 1 and
+                isinstance(parent_box.children[0], boxes.LineBox)):
+            parent_box.children[0].children = local_children
+        else:
+            parent_box.children = local_children
+
+    if style['content'] == 'inhibit':
+        return []
+
+    orig_quote_depth = quote_depth[:]
+    css_token = 'content'
+    return compute_content_list(
+        style['content'], parent_box, counter_values, css_token, parse_again,
+        target_collector, get_image_from_uri, quote_depth, style['quotes'],
+        context, page)
 
 
-def replace_content_lists(element, box, style, counter_values):
-    """Replace the content-lists by strings.
+def compute_string_set(element, box, string_name, content_list,
+                       counter_values, target_collector):
+    """Parse the content-list value of ``string_name`` for ``string-set``."""
+    def parse_again(mixin_pagebased_counters=None):
+        """Closure to parse the string-set string value all again."""
+
+        # Neither alters the mixed-in nor the cached counter values, no
+        # need to deepcopy here
+        if mixin_pagebased_counters is None:
+            local_counters = {}
+        else:
+            local_counters = mixin_pagebased_counters.copy()
+        local_counters.update(box.cached_counter_values)
+
+        compute_string_set(
+            element, box, string_name, content_list, local_counters,
+            target_collector)
+
+    css_token = 'string-set::%s' % string_name
+    box_list = compute_content_list(
+        content_list, box, counter_values, css_token, parse_again,
+        target_collector, element=element)
+    if box_list:
+        string = ''.join(
+            box.text for box in box_list if isinstance(box, boxes.TextBox))
+        # Avoid duplicates, care for parse_again and missing counters, don't
+        # change the pointer
+        for string_set_tuple in box.string_set:
+            if string_set_tuple[0] == string_name:
+                box.string_set.remove(string_set_tuple)
+                break
+        box.string_set.append((string_name, string))
+
+
+def compute_bookmark_label(element, box, content_list, counter_values,
+                           target_collector):
+    """Parses the content-list value for ``bookmark-label``."""
+    def parse_again(mixin_pagebased_counters={}):
+        """Closure to parse the bookmark-label all again."""
+        # Neither alters the mixed-in nor the cached counter values, no
+        # need to deepcopy here
+        if mixin_pagebased_counters is None:
+            local_counters = {}
+        else:
+            local_counters = mixin_pagebased_counters.copy()
+        local_counters = mixin_pagebased_counters.copy()
+        local_counters.update(box.cached_counter_values)
+        compute_bookmark_label(
+            element, box, content_list, local_counters, target_collector)
+
+    css_token = 'bookmark-label'
+    box_list = compute_content_list(
+        content_list, box, counter_values, css_token, parse_again,
+        target_collector, element=element)
+    box.bookmark_label = ''.join(
+        box.text for box in box_list if isinstance(box, boxes.TextBox))
+
+
+def set_content_lists(element, box, style, counter_values, target_collector):
+    """Set the content-lists values.
 
     These content-lists are used in GCPM properties like ``string-set`` and
     ``bookmark-label``.
 
     """
-    string_set = []
-    if style.string_set != 'none':
-        for i, (string_name, string_values) in enumerate(style.string_set):
-            string_set.append((string_name, compute_content_list_string(
-                element, box, counter_values, string_values)))
-    style.string_set = string_set
-
-    if style.bookmark_label == 'none':
-        style.bookmark_label = ''
+    box.string_set = []
+    if style['string_set'] != 'none':
+        for i, (string_name, string_values) in enumerate(style['string_set']):
+            compute_string_set(
+                element, box, string_name, string_values, counter_values,
+                target_collector)
+    if style['bookmark_label'] == 'none':
+        box.bookmark_label = ''
     else:
-        style.bookmark_label = compute_content_list_string(
-            element, box, counter_values, style.bookmark_label)
+        compute_bookmark_label(
+            element, box, style['bookmark_label'], counter_values,
+            target_collector)
 
 
 def update_counters(state, style):
@@ -308,7 +536,7 @@ def update_counters(state, style):
     _quote_depth, counter_values, counter_scopes = state
     sibling_scopes = counter_scopes[-1]
 
-    for name, value in style.counter_reset:
+    for name, value in style['counter_reset']:
         if name in sibling_scopes:
             counter_values[name].pop()
         else:
@@ -316,7 +544,7 @@ def update_counters(state, style):
         counter_values.setdefault(name, []).append(value)
 
     # XXX Disabled for now, only exists in Lists3’s editor’s draft.
-#    for name, value in style.counter_set:
+#    for name, value in style['counter_set']:
 #        values = counter_values.setdefault(name, [])
 #        if not values:
 #            assert name not in sibling_scopes
@@ -324,13 +552,13 @@ def update_counters(state, style):
 #            values.append(0)
 #        values[-1] = value
 
-    counter_increment = style.counter_increment
+    counter_increment = style['counter_increment']
     if counter_increment == 'auto':
         # 'auto' is the initial value but is not valid in stylesheet:
         # there was no counter-increment declaration for this element.
         # (Or the winning value was 'initial'.)
         # http://dev.w3.org/csswg/css3-lists/#declaring-a-list-item
-        if style.display == 'list-item':
+        if style['display'] == 'list-item':
             counter_increment = [('list-item', 1)]
         else:
             counter_increment = []
@@ -351,16 +579,17 @@ def add_box_marker(box, counter_values, get_image_from_uri):
 
     """
     style = box.style
-    image_type, image = style.list_style_image
+    image_type, image = style['list_style_image']
     if image_type == 'url':
         # surface may be None here too, in case the image is not available.
         image = get_image_from_uri(image)
 
     if image is None:
-        type_ = style.list_style_type
+        type_ = style['list_style_type']
         if type_ == 'none':
             return
         counter_value = counter_values.get('list-item', [0])[-1]
+        # TODO: rtl numbered list has the dot on the left
         marker_text = counters.format_list_marker(counter_value, type_)
         marker_box = boxes.TextBox.anonymous_from(box, marker_text)
     else:
@@ -368,17 +597,26 @@ def add_box_marker(box, counter_values, get_image_from_uri):
         marker_box.is_list_marker = True
     marker_box.element_tag += '::marker'
 
-    position = style.list_style_position
+    position = style['list_style_position']
+    direction = box.style['direction']
+    # Apply a margin of 0.5em. The margin to use depends on list-style-position
+    # and direction.
+    half_em = 0.5 * box.style['font_size']
+    propvalue = properties.Dimension(half_em, 'px')
+    marker_box.style = marker_box.style.copy()
+    if position == 'inside' or direction == 'ltr':
+        marker_box.style['margin_right'] = propvalue
+    else:
+        marker_box.style['margin_left'] = propvalue
+
     if position == 'inside':
-        side = 'right' if style.direction == 'ltr' else 'left'
-        margin = style.font_size * 0.5
-        marker_box.style['margin_' + side] = properties.Dimension(margin, 'px')
+        # TODO: rtl markers must be the rightmost box of the first line
         yield marker_box
     elif position == 'outside':
         box.outside_list_marker = marker_box
 
 
-def is_whitespace(box, _has_non_whitespace=re.compile('\S').search):
+def is_whitespace(box, _has_non_whitespace=re.compile('\\S').search):
     """Return True if ``box`` is a TextBox with only whitespace."""
     return isinstance(box, boxes.TextBox) and not _has_non_whitespace(box.text)
 
@@ -392,7 +630,8 @@ def wrap_improper(box, children, wrapper_type, test=None):
 
     """
     if test is None:
-        test = lambda child: isinstance(child, wrapper_type)
+        def test(child):
+            return isinstance(child, wrapper_type)
     improper = []
     for child in children:
         if test(child):
@@ -406,7 +645,14 @@ def wrap_improper(box, children, wrapper_type, test=None):
             # Whitespace either fail the test or were removed earlier,
             # so there is no need to take special care with the definition
             # of "consecutive".
-            improper.append(child)
+            if isinstance(box, boxes.FlexContainerBox):
+                # The display value of a flex item must be "blockified", see
+                # https://www.w3.org/TR/css-flexbox-1/#flex-items
+                # TODO: These blocks are currently ignored, we should
+                # "blockify" them and their children.
+                pass
+            else:
+                improper.append(child)
     if improper:
         wrapper = wrapper_type.anonymous_from(box, children=[])
         # Apply the rules again on the new wrapper
@@ -444,7 +690,7 @@ def table_boxes_children(box, children):
         # one column child.
         if not children:
             children = [boxes.TableColumnBox.anonymous_from(box, [])
-                        for _i in xrange(box.span)]
+                        for _i in range(box.span)]
 
     # rule 1.3
     if box.tabular_container and len(children) >= 2:
@@ -515,7 +761,8 @@ def table_boxes_children(box, children):
     if isinstance(box, boxes.TableBox):
         return wrap_table(box, children)
     else:
-        return box.copy_with_children(children)
+        box.children = list(children)
+        return box
 
 
 def wrap_table(box, children):
@@ -547,7 +794,7 @@ def wrap_table(box, children):
     # Split top and bottom captions
     captions = {'top': [], 'bottom': []}
     for caption in all_captions:
-        captions[caption.style.caption_side].append(caption)
+        captions[caption.style['caption_side']].append(caption)
 
     # Assign X positions on the grid to column boxes
     column_groups = list(wrap_improper(
@@ -557,6 +804,8 @@ def wrap_table(box, children):
         group.grid_x = grid_x
         if group.children:
             for column in group.children:
+                # There's no need to take care of group's span, as "span=x"
+                # already generates x TableColumnBox children
                 column.grid_x = grid_x
                 grid_x += 1
             group.span = len(group.children)
@@ -570,7 +819,7 @@ def wrap_table(box, children):
     header = None
     footer = None
     for group in row_groups:
-        display = group.style.display
+        display = group.style['display']
         if display == 'table-header-group' and header is None:
             group.is_header = True
             header = group
@@ -624,7 +873,7 @@ def wrap_table(box, children):
 
     table = box.copy_with_children(row_groups)
     table.column_groups = tuple(column_groups)
-    if table.style.border_collapse == 'collapse':
+    if table.style['border_collapse'] == 'collapse':
         table.collapsed_border_grid = collapse_table_borders(
             table, grid_width, grid_height)
 
@@ -635,16 +884,19 @@ def wrap_table(box, children):
 
     wrapper = wrapper_type.anonymous_from(
         box, captions['top'] + [table] + captions['bottom'])
+    wrapper.style = wrapper.style.copy()
     wrapper.is_table_wrapper = True
-    if not table.style.anonymous:
-        # Non-inherited properties of the table element apply to one
-        # of the wrapper and the table. The other get the initial value.
-        for name in properties.TABLE_WRAPPER_BOX_PROPERTIES:
-            wrapper.style[name] = table.style[name]
-            table.style[name] = properties.INITIAL_VALUES[name]
-    # else: non-inherited properties already have their initial values
+    # Non-inherited properties of the table element apply to one
+    # of the wrapper and the table. The other get the initial value.
+    # TODO: put this in a method of the table object
+    for name in properties.TABLE_WRAPPER_BOX_PROPERTIES:
+        wrapper.style[name] = table.style[name]
+        table.style[name] = properties.INITIAL_VALUES[name]
 
     return wrapper
+
+
+TRANSPARENT = tinycss2.color3.parse_color('transparent')
 
 
 def collapse_table_borders(table, grid_width, grid_height):
@@ -663,18 +915,20 @@ def collapse_table_borders(table, grid_width, grid_height):
         'hidden', 'double', 'solid', 'dashed', 'dotted', 'ridge',
         'outset', 'groove', 'inset', 'none'])))
     style_map = {'inset': 'ridge', 'outset': 'groove'}
-    transparent = COLOR_KEYWORDS['transparent']
+    transparent = TRANSPARENT
     weak_null_border = (
         (0, 0, style_scores['none']), ('none', 0, transparent))
-    vertical_borders = [[weak_null_border for x in xrange(grid_width + 1)]
-                        for y in xrange(grid_height)]
-    horizontal_borders = [[weak_null_border for x in xrange(grid_width)]
-                          for y in xrange(grid_height + 1)]
+    vertical_borders = [[weak_null_border for x in range(grid_width + 1)]
+                        for y in range(grid_height)]
+    horizontal_borders = [[weak_null_border for x in range(grid_width)]
+                          for y in range(grid_height + 1)]
 
     def set_one_border(border_grid, box_style, side, grid_x, grid_y):
+        from ..draw import get_color
+
         style = box_style['border_%s_style' % side]
         width = box_style['border_%s_width' % side]
-        color = box_style.get_color('border_%s_color' % side)
+        color = get_color(box_style, 'border_%s_color' % side)
 
         # http://www.w3.org/TR/CSS21/tables.html#border-conflict-resolution
         score = ((1 if style == 'hidden' else 0), width, style_scores[style])
@@ -687,10 +941,10 @@ def collapse_table_borders(table, grid_width, grid_height):
 
     def set_borders(box, x, y, w, h):
         style = box.style
-        for yy in xrange(y, y + h):
+        for yy in range(y, y + h):
             set_one_border(vertical_borders, style, 'left', x, yy)
             set_one_border(vertical_borders, style, 'right', x + w, yy)
-        for xx in xrange(x, x + w):
+        for xx in range(x, x + w):
             set_one_border(horizontal_borders, style, 'top', xx, y)
             set_one_border(horizontal_borders, style, 'bottom', xx, y + h)
 
@@ -705,11 +959,11 @@ def collapse_table_borders(table, grid_width, grid_height):
         for row in row_group.children:
             for cell in row.children:
                 # No border inside of a cell with rowspan or colspan
-                for xx in xrange(cell.grid_x + 1, cell.grid_x + cell.colspan):
-                    for yy in xrange(grid_y, grid_y + cell.rowspan):
+                for xx in range(cell.grid_x + 1, cell.grid_x + cell.colspan):
+                    for yy in range(grid_y, grid_y + cell.rowspan):
                         vertical_borders[yy][xx] = strong_null_border
-                for xx in xrange(cell.grid_x, cell.grid_x + cell.colspan):
-                    for yy in xrange(grid_y + 1, grid_y + cell.rowspan):
+                for xx in range(cell.grid_x, cell.grid_x + cell.colspan):
+                    for yy in range(grid_y + 1, grid_y + cell.rowspan):
                         horizontal_borders[yy][xx] = strong_null_border
                 # The cell’s own borders
                 set_borders(cell, x=cell.grid_x, y=grid_y,
@@ -742,10 +996,9 @@ def collapse_table_borders(table, grid_width, grid_height):
     # the correct widths on each box. The actual border grid will be
     # painted separately.
     def set_transparent_border(box, side, twice_width):
-        style = box.style
-        style['border_%s_style' % side] = 'solid'
-        style['border_%s_width' % side] = twice_width / 2
-        style['border_%s_color' % side] = transparent
+        box.style['border_%s_style' % side] = 'solid',
+        box.style['border_%s_width' % side] = twice_width / 2
+        box.style['border_%s_color' % side] = transparent
 
     def remove_borders(box):
         set_transparent_border(box, 'top', 0)
@@ -755,11 +1008,12 @@ def collapse_table_borders(table, grid_width, grid_height):
 
     def max_vertical_width(x, y, h):
         return max(
-            width for grid_row in vertical_borders[y:y+h]
+            width for grid_row in vertical_borders[y:y + h]
             for _, (_, width, _) in [grid_row[x]])
 
     def max_horizontal_width(x, y, w):
-        return max(width for _, (_, width, _) in horizontal_borders[y][x:x+w])
+        return max(
+            width for _, (_, width, _) in horizontal_borders[y][x:x + w])
 
     grid_y = 0
     for row_group in table.children:
@@ -798,6 +1052,54 @@ def collapse_table_borders(table, grid_width, grid_height):
     return vertical_borders, horizontal_borders
 
 
+def flex_boxes(box):
+    """Remove and add boxes according to the flex model.
+
+    Take and return a ``Box`` object.
+
+    See http://www.w3.org/TR/css-flexbox-1/#flex-items
+
+    """
+    if not isinstance(box, boxes.ParentBox):
+        return box
+
+    # Do recursion.
+    children = [flex_boxes(child) for child in box.children]
+    box.children = flex_children(box, children)
+    return box
+
+
+def flex_children(box, children):
+    if isinstance(box, boxes.FlexContainerBox):
+        flex_children = []
+        for child in children:
+            if not child.is_absolutely_positioned():
+                child.is_flex_item = True
+            if isinstance(child, boxes.TextBox) and not child.text.strip(' '):
+                # TODO: ignore texts only containing "characters that can be
+                # affected by the white-space property"
+                # https://www.w3.org/TR/css-flexbox-1/#flex-items
+                continue
+            if isinstance(child, boxes.InlineLevelBox):
+                # TODO: Only create block boxes for text runs, not for other
+                # inline level boxes. This is false but currently needed
+                # because block_level_width and block_level_layout are called
+                # in layout.flex.
+                if isinstance(child, boxes.ParentBox):
+                    anonymous = boxes.BlockBox.anonymous_from(
+                        box, child.children)
+                    anonymous.style = child.style
+                else:
+                    anonymous = boxes.BlockBox.anonymous_from(box, [child])
+                anonymous.is_flex_item = True
+                flex_children.append(anonymous)
+            else:
+                flex_children.append(child)
+        return flex_children
+    else:
+        return children
+
+
 def process_whitespace(box, following_collapsible_space=False):
     """First part of "The 'white-space' processing model".
 
@@ -813,35 +1115,29 @@ def process_whitespace(box, following_collapsible_space=False):
         # Normalize line feeds
         text = re.sub('\r\n?', '\n', text)
 
-        handling = box.style.white_space
+        new_line_collapse = box.style['white_space'] in ('normal', 'nowrap')
+        space_collapse = box.style['white_space'] in (
+            'normal', 'nowrap', 'pre-line')
 
-        if handling in ('normal', 'nowrap', 'pre-line'):
+        if space_collapse:
             # \r characters were removed/converted earlier
             text = re.sub('[\t ]*\n[\t ]*', '\n', text)
-        if handling in ('pre', 'pre-wrap'):
-            # \xA0 is the non-breaking space
-            text = text.replace(' ', '\xA0')
-            if handling == 'pre-wrap':
-                # "a line break opportunity at the end of the sequence"
-                # \u200B is the zero-width space, marks a line break
-                # opportunity.
-                text = re.sub('\xA0([^\xA0]|$)', '\xA0\u200B\\1', text)
-        elif handling in ('normal', 'nowrap'):
+
+        if new_line_collapse:
             # TODO: this should be language-specific
             # Could also replace with a zero width space character (U+200B),
             # or no character
             # CSS3: http://www.w3.org/TR/css3-text/#line-break-transform
             text = text.replace('\n', ' ')
 
-        if handling in ('normal', 'nowrap', 'pre-line'):
+        if space_collapse:
             text = text.replace('\t', ' ')
             text = re.sub(' +', ' ', text)
             previous_text = text
             if following_collapsible_space and text.startswith(' '):
                 text = text[1:]
+                box.leading_collapsible_space = True
             following_collapsible_space = previous_text.endswith(' ')
-            if handling == 'nowrap':
-                text = re.sub('(?!^) (?!$)', '\xA0', text)
         else:
             following_collapsible_space = False
 
@@ -902,13 +1198,34 @@ def inline_in_block(box):
     if not isinstance(box, boxes.ParentBox):
         return box
 
-    children = [inline_in_block(child) for child in box.children
-                # Remove empty text boxes.
-                # (They may have been emptied by process_whitespace().)
-                if not (isinstance(child, boxes.TextBox) and not child.text)]
+    box_children = list(box.children)
+
+    if box_children and box.leading_collapsible_space is False:
+        box.leading_collapsible_space = (
+            box_children[0].leading_collapsible_space)
+
+    children = []
+    trailing_collapsible_space = False
+    for child in box_children:
+        # Keep track of removed collapsing spaces for wrap opportunities, and
+        # remove empty text boxes.
+        # (They may have been emptied by process_whitespace().)
+
+        if trailing_collapsible_space:
+            child.leading_collapsible_space = True
+
+        if isinstance(child, boxes.TextBox) and not child.text:
+            trailing_collapsible_space = child.leading_collapsible_space
+        else:
+            trailing_collapsible_space = False
+            children.append(inline_in_block(child))
+
+    if box.trailing_collapsible_space is False:
+        box.trailing_collapsible_space = trailing_collapsible_space
 
     if not isinstance(box, boxes.BlockContainerBox):
-        return box.copy_with_children(children)
+        box.children = children
+        return box
 
     new_line_children = []
     new_children = []
@@ -925,7 +1242,7 @@ def inline_in_block(box):
                     # Sequence of white-space was collapsed to a single
                     # space by process_whitespace().
                     child_box.text == ' ' and
-                    child_box.style.white_space in (
+                    child_box.style['white_space'] in (
                         'normal', 'nowrap', 'pre-line')):
                 new_line_children.append(child_box)
         else:
@@ -947,7 +1264,8 @@ def inline_in_block(box):
             # Only inline-level children: one line box
             new_children.append(line_box)
 
-    return box.copy_with_children(new_children)
+    box.children = new_children
+    return box
 
 
 def block_in_inline(box):
@@ -1048,9 +1366,8 @@ def block_in_inline(box):
         new_children.append(new_child)
 
     if changed:
-        return box.copy_with_children(new_children)
-    else:
-        return box
+        box.children = new_children
+    return box
 
 
 def _inner_block_in_inline(box, skip_stack=None):
@@ -1118,14 +1435,14 @@ def set_viewport_overflow(root_box):
     """
     chosen_box = root_box
     if (root_box.element_tag.lower() == 'html' and
-            root_box.style.overflow == 'visible'):
+            root_box.style['overflow'] == 'visible'):
         for child in root_box.children:
             if child.element_tag.lower() == 'body':
                 chosen_box = child
                 break
 
-    root_box.viewport_overflow = chosen_box.style.overflow
-    chosen_box.style = chosen_box.style.updated_copy({'overflow': 'visible'})
+    root_box.viewport_overflow = chosen_box.style['overflow']
+    chosen_box.style['overflow'] = 'visible'
     return root_box
 
 
@@ -1135,18 +1452,35 @@ def box_text(box):
     elif isinstance(box, boxes.ParentBox):
         return ''.join(
             child.text for child in box.descendants()
-            if not child.element_tag.endswith(':before') and
-            not child.element_tag.endswith(':after') and
+            if not child.element_tag.endswith('::before') and
+            not child.element_tag.endswith('::after') and
             isinstance(child, boxes.TextBox))
     else:
         return ''
+
+
+def box_text_first_letter(box):
+    # TODO: use the same code as in inlines.first_letter_to_box
+    character_found = False
+    first_letter = ''
+    text = box_text(box)
+    while text:
+        next_letter = text[0]
+        category = unicodedata.category(next_letter)
+        if category not in ('Ps', 'Pe', 'Pi', 'Pf', 'Po'):
+            if character_found:
+                break
+            character_found = True
+        first_letter += next_letter
+        text = text[1:]
+    return first_letter
 
 
 def box_text_before(box):
     if isinstance(box, boxes.ParentBox):
         return ''.join(
             box_text(child) for child in box.descendants()
-            if child.element_tag.endswith(':before') and
+            if child.element_tag.endswith('::before') and
             not isinstance(child, boxes.ParentBox))
     else:
         return ''
@@ -1156,7 +1490,7 @@ def box_text_after(box):
     if isinstance(box, boxes.ParentBox):
         return ''.join(
             box_text(child) for child in box.descendants()
-            if child.element_tag.endswith(':after') and
+            if child.element_tag.endswith('::after') and
             not isinstance(child, boxes.ParentBox))
     else:
         return ''
@@ -1164,5 +1498,7 @@ def box_text_after(box):
 
 TEXT_CONTENT_EXTRACTORS = {
     'text': box_text,
+    'content': box_text,
     'before': box_text_before,
-    'after': box_text_after}
+    'after': box_text_after,
+    'first-letter': box_text_first_letter}

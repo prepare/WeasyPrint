@@ -1,28 +1,24 @@
-# coding: utf8
 """
     weasyprint.backgrounds
     ----------------------
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
-from __future__ import division, unicode_literals
-
 from collections import namedtuple
 from itertools import cycle
 
-from ..formatting_structure import boxes
 from . import replaced
+from ..formatting_structure import boxes
 from .percentages import resolve_radii_percentages
-
 
 Background = namedtuple('Background', 'color, layers, image_rendering')
 BackgroundLayer = namedtuple(
     'BackgroundLayer',
     'image, size, position, repeat, unbounded, '
-    'painting_area, positioning_area, rounded_box')
+    'painting_area, positioning_area, clipped_boxes')
 
 
 def box_rectangle(box, which_rectangle):
@@ -52,6 +48,8 @@ def box_rectangle(box, which_rectangle):
 
 def layout_box_backgrounds(page, box, get_image_from_uri):
     """Fetch and position background images."""
+    from ..draw import get_color
+
     # Resolve percentages in border-radius properties
     resolve_radii_percentages(box)
 
@@ -59,27 +57,30 @@ def layout_box_backgrounds(page, box, get_image_from_uri):
         layout_box_backgrounds(page, child, get_image_from_uri)
 
     style = box.style
-    if style.visibility == 'hidden':
+    if style['visibility'] == 'hidden':
         box.background = None
-        return
+        if page != box:  # Pages need a background for bleed box
+            return
 
     images = [get_image_from_uri(value) if type_ == 'url' else value
-              for type_, value in style.background_image]
-    color = style.get_color('background_color')
+              for type_, value in style['background_image']]
+    color = get_color(style, 'background_color')
     if color.alpha == 0 and not any(images):
         box.background = None
-        return
+        if page != box:  # Pages need a background for bleed box
+            return
 
+    layers = [
+        layout_background_layer(box, page, style['image_resolution'], *layer)
+        for layer in zip(images, *map(cycle, [
+            style['background_size'],
+            style['background_clip'],
+            style['background_repeat'],
+            style['background_origin'],
+            style['background_position'],
+            style['background_attachment']]))]
     box.background = Background(
-        color=color, image_rendering=style.image_rendering, layers=[
-            layout_background_layer(box, page, style.image_resolution, *layer)
-            for layer in zip(images, *map(cycle, [
-                style.background_size,
-                style.background_clip,
-                style.background_repeat,
-                style.background_origin,
-                style.background_position,
-                style.background_attachment]))])
+        color=color, image_rendering=style['image_rendering'], layers=layers)
 
 
 def percentage(value, refer_to):
@@ -96,25 +97,62 @@ def percentage(value, refer_to):
 def layout_background_layer(box, page, resolution, image, size, clip, repeat,
                             origin, position, attachment):
 
-    if box is not page:
-        painting_area = box_rectangle(box, clip)
-        if clip == 'border-box':
-            rounded_box = box.rounded_border_box()
-        elif clip == 'padding-box':
-            rounded_box = box.rounded_padding_box()
-        else:
-            assert clip == 'content-box', clip
-            rounded_box = box.rounded_content_box()
-    else:
+    # TODO: respect box-sizing for table cells?
+    clipped_boxes = []
+    painting_area = 0, 0, 0, 0
+    if box is page:
         painting_area = 0, 0, page.margin_width(), page.margin_height()
         # XXX: how does border-radius work on pages?
-        rounded_box = box.rounded_border_box()
+        clipped_boxes = [box.rounded_border_box()]
+    elif isinstance(box, boxes.TableRowGroupBox):
+        clipped_boxes = []
+        total_height = 0
+        for row in box.children:
+            if row.children:
+                clipped_boxes += [
+                    cell.rounded_border_box() for cell in row.children]
+                total_height = max(total_height, max(
+                    cell.border_box_y() + cell.border_height()
+                    for cell in row.children))
+        painting_area = [
+            box.border_box_x(), box.border_box_y(),
+            box.border_box_x() + box.border_width(), total_height]
+    elif isinstance(box, boxes.TableRowBox):
+        if box.children:
+            clipped_boxes = [
+                cell.rounded_border_box() for cell in box.children]
+            height = max(
+                cell.border_height() for cell in box.children)
+            painting_area = [
+                box.border_box_x(), box.border_box_y(),
+                box.border_box_x() + box.border_width(),
+                box.border_box_y() + height]
+    elif isinstance(box, (boxes.TableColumnGroupBox, boxes.TableColumnBox)):
+        cells = box.get_cells()
+        if cells:
+            clipped_boxes = [cell.rounded_border_box() for cell in cells]
+            max_x = max(
+                cell.border_box_x() + cell.border_width()
+                for cell in cells)
+            painting_area = [
+                box.border_box_x(), box.border_box_y(),
+                max_x - box.border_box_x(),
+                box.border_box_y() + box.border_height()]
+    else:
+        painting_area = box_rectangle(box, clip)
+        if clip == 'border-box':
+            clipped_boxes = [box.rounded_border_box()]
+        elif clip == 'padding-box':
+            clipped_boxes = [box.rounded_padding_box()]
+        else:
+            assert clip == 'content-box', clip
+            clipped_boxes = [box.rounded_content_box()]
 
-    if image is None or 0 in image.get_intrinsic_size(1):
+    if image is None or 0 in image.get_intrinsic_size(1, 1):
         return BackgroundLayer(
             image=None, unbounded=(box is page), painting_area=painting_area,
             size='unused', position='unused', repeat='unused',
-            positioning_area='unused', rounded_box=box.rounded_border_box())
+            positioning_area='unused', clipped_boxes=clipped_boxes)
 
     if attachment == 'fixed':
         # Initial containing block
@@ -135,7 +173,8 @@ def layout_background_layer(box, page, resolution, image, size, clip, repeat,
             positioning_width, positioning_height, image.intrinsic_ratio)
     else:
         size_width, size_height = size
-        iwidth, iheight = image.get_intrinsic_size(resolution)
+        iwidth, iheight = image.get_intrinsic_size(
+            resolution, box.style['font_size'])
         image_width, image_height = replaced.default_image_sizing(
             iwidth, iheight, image.intrinsic_ratio,
             percentage(size_width, positioning_width),
@@ -177,7 +216,7 @@ def layout_background_layer(box, page, resolution, image, size, clip, repeat,
         unbounded=(box is page),
         painting_area=painting_area,
         positioning_area=positioning_area,
-        rounded_box=rounded_box)
+        clipped_boxes=clipped_boxes)
 
 
 def set_canvas_background(page):

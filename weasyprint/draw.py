@@ -1,16 +1,13 @@
-# coding: utf8
 """
     weasyprint.draw
     ---------------
 
     Take an "after layout" box tree and draw it onto a cairo context.
 
-    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2018 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
-
-from __future__ import division, unicode_literals
 
 import contextlib
 import math
@@ -19,12 +16,67 @@ import operator
 import cairocffi as cairo
 
 from .formatting_structure import boxes
+from .images import SVGImage
+from .layout.backgrounds import BackgroundLayer
 from .stacking import StackingContext
 from .text import show_first_line
-from .compat import xrange
-
 
 SIDES = ('top', 'right', 'bottom', 'left')
+CROP = '''
+  <!-- horizontal top left -->
+  <path d="M0,{bleed_top} h{half_bleed_left}" />
+  <!-- horizontal top right -->
+  <path d="M0,{bleed_top} h{half_bleed_right}"
+        transform="translate({width},0) scale(-1,1)" />
+  <!-- horizontal bottom right -->
+  <path d="M0,{bleed_bottom} h{half_bleed_right}"
+        transform="translate({width},{height}) scale(-1,-1)" />
+  <!-- horizontal bottom left -->
+  <path d="M0,{bleed_bottom} h{half_bleed_left}"
+        transform="translate(0,{height}) scale(1,-1)" />
+  <!-- vertical top left -->
+  <path d="M{bleed_left},0 v{half_bleed_top}" />
+  <!-- vertical bottom right -->
+  <path d="M{bleed_right},0 v{half_bleed_bottom}"
+        transform="translate({width},{height}) scale(-1,-1)" />
+  <!-- vertical bottom left -->
+  <path d="M{bleed_left},0 v{half_bleed_bottom}"
+        transform="translate(0,{height}) scale(1,-1)" />
+  <!-- vertical top right -->
+  <path d="M{bleed_right},0 v{half_bleed_top}"
+        transform="translate({width},0) scale(-1,1)" />
+'''
+CROSS = '''
+  <!-- top -->
+  <circle r="{half_bleed_top}"
+          transform="scale(0.5)
+                     translate({width},{half_bleed_top}) scale(0.5)" />
+  <path d="M-{half_bleed_top},{half_bleed_top} h{bleed_top}
+           M0,0 v{bleed_top}"
+        transform="scale(0.5) translate({width},0)" />
+  <!-- bottom -->
+  <circle r="{half_bleed_bottom}"
+          transform="translate(0,{height}) scale(0.5)
+                     translate({width},-{half_bleed_bottom}) scale(0.5)" />
+  <path d="M-{half_bleed_bottom},-{half_bleed_bottom} h{bleed_bottom}
+           M0,0 v-{bleed_bottom}"
+        transform="translate(0,{height}) scale(0.5) translate({width},0)" />
+  <!-- left -->
+  <circle r="{half_bleed_left}"
+          transform="scale(0.5)
+                     translate({half_bleed_left},{height}) scale(0.5)" />
+  <path d="M{half_bleed_left},-{half_bleed_left} v{bleed_left}
+           M0,0 h{bleed_left}"
+        transform="scale(0.5) translate(0,{height})" />
+  <!-- right -->
+  <circle r="{half_bleed_right}"
+          transform="translate({width},0) scale(0.5)
+                     translate(-{half_bleed_right},{height}) scale(0.5)" />
+  <path d="M-{half_bleed_right},-{half_bleed_right} v{bleed_right}
+           M0,0 h-{bleed_right}"
+        transform="translate({width},0)
+                   scale(0.5) translate(0,{height})" />
+'''
 
 
 @contextlib.contextmanager
@@ -73,6 +125,11 @@ def rgb2hsv(red, green, blue):
     return hue, saturation, cmax
 
 
+def get_color(style, key):
+    value = style[key]
+    return value if value != 'currentColor' else style['color']
+
+
 def darken(color):
     """Return a darker color."""
     hue, saturation, value = rgb2hsv(color.red, color.green, color.blue)
@@ -92,10 +149,14 @@ def lighten(color):
 
 def draw_page(page, context, enable_hinting):
     """Draw the given PageBox."""
+    bleed = {
+        side: page.style['bleed_%s' % side].value
+        for side in ('top', 'right', 'bottom', 'left')}
+    marks = page.style['marks']
     stacking_context = StackingContext.from_page(page)
     draw_background(
         context, stacking_context.box.background, enable_hinting,
-        clip_box=False)
+        clip_box=False, bleed=bleed, marks=marks)
     draw_background(
         context, page.canvas_background, enable_hinting, clip_box=False)
     draw_border(context, page, enable_hinting)
@@ -105,27 +166,17 @@ def draw_page(page, context, enable_hinting):
 def draw_box_background_and_border(context, page, box, enable_hinting):
     draw_background(context, box.background, enable_hinting)
     if isinstance(box, boxes.TableBox):
-        for column_group in box.column_groups:
-            draw_box_background_and_border(
-                context, page, column_group, enable_hinting)
-        for row_group in box.children:
-            draw_background(context, row_group.background, enable_hinting)
-            for row in row_group.children:
-                draw_background(context, row.background, enable_hinting)
-                for cell in row.children:
-                    draw_background(context, cell.background, enable_hinting)
-        if box.style.border_collapse == 'separate':
+        draw_table_backgrounds(context, page, box, enable_hinting)
+        if box.style['border_collapse'] == 'separate':
             draw_border(context, box, enable_hinting)
             for row_group in box.children:
                 for row in row_group.children:
                     for cell in row.children:
-                        draw_border(context, cell, enable_hinting)
+                        if (cell.style['empty_cells'] == 'show' or
+                                not cell.empty):
+                            draw_border(context, cell, enable_hinting)
         else:
             draw_collapsed_borders(context, box, enable_hinting)
-    elif isinstance(box, (boxes.TableColumnGroupBox, boxes.TableRowGroupBox)):
-        for child in box.children:
-            draw_box_background_and_border(
-                context, page, child, enable_hinting)
     else:
         draw_border(context, box, enable_hinting)
 
@@ -135,8 +186,8 @@ def draw_stacking_context(context, stacking_context, enable_hinting):
     # See http://www.w3.org/TR/CSS2/zindex.html
     with stacked(context):
         box = stacking_context.box
-        if box.is_absolutely_positioned() and box.style.clip:
-            top, right, bottom, left = box.style.clip
+        if box.is_absolutely_positioned() and box.style['clip']:
+            top, right, bottom, left = box.style['clip']
             if top == 'auto':
                 top = 0
             if right == 'auto':
@@ -152,23 +203,29 @@ def draw_stacking_context(context, stacking_context, enable_hinting):
                 bottom - top)
             context.clip()
 
-        if box.style.opacity < 1:
+        if box.style['opacity'] < 1:
             context.push_group()
 
         if box.transformation_matrix:
-            context.transform(box.transformation_matrix)
+            try:
+                box.transformation_matrix.copy().invert()
+            except cairo.CairoError:
+                return
+            else:
+                context.transform(box.transformation_matrix)
 
         # Point 1 is done in draw_page
 
         # Point 2
         if isinstance(box, (boxes.BlockBox, boxes.MarginBox,
-                            boxes.InlineBlockBox, boxes.TableCellBox)):
+                            boxes.InlineBlockBox, boxes.TableCellBox,
+                            boxes.FlexContainerBox)):
             # The canvas background was removed by set_canvas_background
             draw_box_background_and_border(
                 context, stacking_context.page, box, enable_hinting)
 
         with stacked(context):
-            if box.style.overflow != 'visible':
+            if box.style['overflow'] != 'visible':
                 # Only clip the content and the children:
                 # - the background is already clipped
                 # - the border must *not* be clipped
@@ -222,9 +279,9 @@ def draw_stacking_context(context, stacking_context, enable_hinting):
         # Point 10
         draw_outlines(context, box, enable_hinting)
 
-        if box.style.opacity < 1:
+        if box.style['opacity'] < 1:
             context.pop_group_to_source()
-            context.paint_with_alpha(box.style.opacity)
+            context.paint_with_alpha(box.style['opacity'])
 
 
 def rounded_box_path(context, radii):
@@ -255,6 +312,7 @@ def rounded_box_path(context, radii):
         return
 
     context.move_to(x, y)
+    context.new_sub_path()
     for i, (w, h, (rx, ry)) in enumerate((
             (0, 0, tl), (w, 0, tr), (w, h, br), (0, h, bl))):
         context.save()
@@ -268,7 +326,8 @@ def rounded_box_path(context, radii):
         context.restore()
 
 
-def draw_background(context, bg, enable_hinting, clip_box=True):
+def draw_background(context, bg, enable_hinting, clip_box=True, bleed=None,
+                    marks=()):
     """Draw the background color and image to a ``cairo.Context``.
 
     If ``clip_box`` is set to ``False``, the background is not clipped to the
@@ -284,7 +343,8 @@ def draw_background(context, bg, enable_hinting, clip_box=True):
             context.set_antialias(cairo.ANTIALIAS_NONE)
 
         if clip_box:
-            rounded_box_path(context, bg.layers[-1].rounded_box)
+            for box in bg.layers[-1].clipped_boxes:
+                rounded_box_path(context, box)
             context.clip()
 
         # Background color
@@ -292,14 +352,77 @@ def draw_background(context, bg, enable_hinting, clip_box=True):
             with stacked(context):
                 painting_area = bg.layers[-1].painting_area
                 if painting_area:
+                    if bleed:
+                        # Painting area is the PDF BleedBox
+                        x, y, width, height = painting_area
+                        painting_area = (
+                            x - bleed['left'], y - bleed['top'],
+                            width + bleed['left'] + bleed['right'],
+                            height + bleed['top'] + bleed['bottom'])
                     context.rectangle(*painting_area)
                     context.clip()
                 context.set_source_rgba(*bg.color)
                 context.paint()
 
+        if bleed and marks:
+            x, y, width, height = bg.layers[-1].painting_area
+            x -= bleed['left']
+            y -= bleed['top']
+            width += bleed['left'] + bleed['right']
+            height += bleed['top'] + bleed['bottom']
+            svg = '''
+              <svg height="{height}" width="{width}"
+                   fill="transparent" stroke="black" stroke-width="1"
+                   xmlns="http://www.w3.org/2000/svg"
+                   xmlns:xlink="http://www.w3.org/1999/xlink">
+            '''
+            if 'crop' in marks:
+                svg += CROP
+            if 'cross' in marks:
+                svg += CROSS
+            svg += '</svg>'
+            half_bleed = {key: value * 0.5 for key, value in bleed.items()}
+            image = SVGImage(svg.format(
+                height=height, width=width,
+                bleed_left=bleed['left'], bleed_right=bleed['right'],
+                bleed_top=bleed['top'], bleed_bottom=bleed['bottom'],
+                half_bleed_left=half_bleed['left'],
+                half_bleed_right=half_bleed['right'],
+                half_bleed_top=half_bleed['top'],
+                half_bleed_bottom=half_bleed['bottom'],
+            ), '', None)
+            # Painting area is the PDF media box
+            size = (width, height)
+            position = (x, y)
+            repeat = ('no-repeat', 'no-repeat')
+            unbounded = True
+            painting_area = position + size
+            positioning_area = (0, 0, width, height)
+            clipped_boxes = []
+            layer = BackgroundLayer(
+                image, size, position, repeat, unbounded, painting_area,
+                positioning_area, clipped_boxes)
+            bg.layers.insert(0, layer)
         # Paint in reversed order: first layer is "closest" to the viewer.
         for layer in reversed(bg.layers):
             draw_background_image(context, layer, bg.image_rendering)
+
+
+def draw_table_backgrounds(context, page, table, enable_hinting):
+    """Draw the background color and image of the table children."""
+    for column_group in table.column_groups:
+        draw_background(context, column_group.background, enable_hinting)
+        for column in column_group.children:
+            draw_background(context, column.background, enable_hinting)
+    for row_group in table.children:
+        draw_background(context, row_group.background, enable_hinting)
+        for row in row_group.children:
+            draw_background(context, row.background, enable_hinting)
+            for cell in row.children:
+                if (table.style['border_collapse'] == 'collapse' or
+                        cell.style['empty_cells'] == 'show' or
+                        not cell.empty):
+                    draw_background(context, cell.background, enable_hinting)
 
 
 def draw_background_image(context, layer, image_rendering):
@@ -385,17 +508,46 @@ def draw_border(context, box, enable_hinting):
     # We need a plan to draw beautiful borders, and that's difficult, no need
     # to lie. Let's try to find the cases that we can handle in a smart way.
 
+    def draw_column_border():
+        """Draw column borders."""
+        columns = (
+            isinstance(box, boxes.BlockContainerBox) and (
+                box.style['column_width'] != 'auto' or
+                box.style['column_count'] != 'auto'))
+        if columns and box.style['column_rule_width']:
+            border_widths = (0, 0, 0, box.style['column_rule_width'])
+            for child in box.children[1:]:
+                with stacked(context):
+                    position_x = (child.position_x - (
+                        box.style['column_rule_width'] +
+                        box.style['column_gap']) / 2)
+                    border_box = (
+                        position_x, child.position_y,
+                        box.style['column_rule_width'], box.height)
+                    clip_border_segment(
+                        context, enable_hinting,
+                        box.style['column_rule_style'],
+                        box.style['column_rule_width'], 'left', border_box,
+                        border_widths)
+                    draw_rect_border(
+                        context, border_box, border_widths,
+                        box.style['column_rule_style'], styled_color(
+                            box.style['column_rule_style'],
+                            get_color(box.style, 'column_rule_color'), 'left'))
+
     # The box is hidden, easy.
-    if box.style.visibility != 'visible':
+    if box.style['visibility'] != 'visible':
+        draw_column_border()
         return
 
     widths = [getattr(box, 'border_%s_width' % side) for side in SIDES]
 
     # No border, return early.
     if all(width == 0 for width in widths):
+        draw_column_border()
         return
 
-    colors = [box.style.get_color('border_%s_color' % side) for side in SIDES]
+    colors = [get_color(box.style, 'border_%s_color' % side) for side in SIDES]
     styles = [
         colors[i].alpha and box.style['border_%s_style' % side]
         for (i, side) in enumerate(SIDES)]
@@ -405,6 +557,7 @@ def draw_border(context, box, enable_hinting):
     if set(styles) in (set(('solid',)), set(('double',))) and (
             len(set(colors)) == 1):
         draw_rounded_border(context, box, styles[0], colors[0])
+        draw_column_border()
         return
 
     # We're not smart enough to find a good way to draw the borders :/. We must
@@ -419,6 +572,8 @@ def draw_border(context, box, enable_hinting):
                 box.rounded_border_box()[4:])
             draw_rounded_border(
                 context, box, style, styled_color(style, color, side))
+
+    draw_column_border()
 
 
 def clip_border_segment(context, enable_hinting, style, width, side,
@@ -546,11 +701,11 @@ def clip_border_segment(context, enable_hinting, style, width, side,
                 for i in range(0, dashes, 2):
                     i += 0.5  # half dash
                     angle1 = (
-                        ((2 * angle - way) + i * way * dash / chl)
-                        / 4 * math.pi)
+                        ((2 * angle - way) + i * way * dash / chl) /
+                        4 * math.pi)
                     angle2 = (min if way > 0 else max)(
-                        ((2 * angle - way) + (i + 1) * way * dash / chl)
-                        / 4 * math.pi,
+                        ((2 * angle - way) + (i + 1) * way * dash / chl) /
+                        4 * math.pi,
                         angle * math.pi / 2)
                     if side in ('top', 'bottom'):
                         context.move_to(x + px, main_offset + py)
@@ -570,8 +725,8 @@ def clip_border_segment(context, enable_hinting, style, width, side,
                             y + py + way * py * math.tan(angle1))
                     if angle2 == angle * math.pi / 2:
                         offset = (angle1 - angle2) / ((
-                            ((2 * angle - way) + (i + 1) * way * dash / chl)
-                            / 4 * math.pi) - angle1)
+                            ((2 * angle - way) + (i + 1) * way * dash / chl) /
+                            4 * math.pi) - angle1)
                         line += 1
                         break
                 else:
@@ -671,10 +826,10 @@ def draw_rect_border(context, box, widths, style, color):
 
 
 def draw_outlines(context, box, enable_hinting):
-    width = box.style.outline_width
-    color = box.style.get_color('outline_color')
-    style = box.style.outline_style
-    if box.style.visibility == 'visible' and width != 0 and color.alpha != 0:
+    width = box.style['outline_width']
+    color = get_color(box.style, 'outline_color')
+    style = box.style['outline_style']
+    if box.style['visibility'] == 'visible' and width and color.alpha:
         outline_box = (
             box.border_box_x() - width, box.border_box_y() - width,
             box.border_width() + 2 * width, box.border_height() + 2 * width)
@@ -785,11 +940,11 @@ def draw_collapsed_borders(context, table, enable_hinting):
             score, style, width, color, 'top',
             (pos_x1, pos_y - width / 2, pos_x2 - pos_x1, 0)))
 
-    for x in xrange(grid_width):
+    for x in range(grid_width):
         add_horizontal(x, 0)
-    for y in xrange(grid_height):
+    for y in range(grid_height):
         add_vertical(0, y)
-        for x in xrange(grid_width):
+        for x in range(grid_width):
             add_vertical(x + 1, y)
             add_horizontal(x, y + 1)
 
@@ -816,7 +971,7 @@ def draw_collapsed_borders(context, table, enable_hinting):
 
 def draw_replacedbox(context, box):
     """Draw the given :class:`boxes.ReplacedBox` to a ``cairo.context``."""
-    if box.style.visibility != 'visible' or box.width == 0 or box.height == 0:
+    if box.style['visibility'] != 'visible' or not box.width or not box.height:
         return
 
     with stacked(context):
@@ -824,13 +979,14 @@ def draw_replacedbox(context, box):
         context.clip()
         context.translate(box.content_box_x(), box.content_box_y())
         box.replacement.draw(
-            context, box.width, box.height, box.style.image_rendering)
+            context, box.width, box.height, box.style['image_rendering'])
 
 
 def draw_inline_level(context, page, box, enable_hinting):
     if isinstance(box, StackingContext):
         stacking_context = box
-        assert isinstance(stacking_context.box, boxes.InlineBlockBox)
+        assert isinstance(
+            stacking_context.box, (boxes.InlineBlockBox, boxes.InlineFlexBox))
         draw_stacking_context(context, stacking_context, enable_hinting)
     else:
         draw_background(context, box.background, enable_hinting)
@@ -852,21 +1008,24 @@ def draw_inline_level(context, page, box, enable_hinting):
 def draw_text(context, textbox, enable_hinting):
     """Draw ``textbox`` to a ``cairo.Context`` from ``PangoCairo.Context``."""
     # Pango crashes with font-size: 0
-    assert textbox.style.font_size
+    assert textbox.style['font_size']
 
-    if textbox.style.visibility != 'visible':
+    if textbox.style['visibility'] != 'visible':
         return
 
     context.move_to(textbox.position_x, textbox.position_y + textbox.baseline)
-    context.set_source_rgba(*textbox.style.color)
+    context.set_source_rgba(*textbox.style['color'])
     show_first_line(context, textbox.pango_layout, enable_hinting)
-    values = textbox.style.text_decoration
+    values = textbox.style['text_decoration']
 
-    metrics = textbox.pango_layout.get_font_metrics()
-    thickness = textbox.style.font_size / 18  # That's what other browsers do
+    thickness = textbox.style['font_size'] / 18  # Like other browsers do
     if enable_hinting and thickness < 1:
         thickness = 1
 
+    if ('overline' in values or
+            'line-through' in values or
+            'underline' in values):
+        metrics = textbox.pango_layout.get_font_metrics()
     if 'overline' in values:
         draw_text_decoration(
             context, textbox,
@@ -890,7 +1049,7 @@ def draw_text_decoration(context, textbox, offset_y, thickness,
     with stacked(context):
         if enable_hinting:
             context.set_antialias(cairo.ANTIALIAS_NONE)
-        context.set_source_rgba(*textbox.style.color)
+        context.set_source_rgba(*textbox.style['color'])
         context.set_line_width(thickness)
         context.move_to(textbox.position_x, textbox.position_y + offset_y)
         context.rel_line_to(textbox.width, 0)

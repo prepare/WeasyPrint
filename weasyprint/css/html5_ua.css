@@ -3,8 +3,8 @@
 User agent stylsheet for HTML.
 
 Contributed by Peter Moulder.
-Based on suggested styles in the HTML5 specification and what various
-web browsers use.
+Based on suggested styles in the HTML5 specification, CSS 2.1, and
+what various web browsers use.
 
 */
 
@@ -213,7 +213,7 @@ big { font-size: larger; }
 blink { text-decoration: blink; }
 blockquote { display: block; margin: 1em 40px; unicode-bidi: isolate; }
 body { display: block; margin: 8px; }
-br:before { content: '\A'; white-space: pre-line; }
+br::before { content: '\A'; white-space: pre-line; }
 button { display: inline-block; text-align: center; text-indent: 0; }
 caption { display: table-caption; unicode-bidi: isolate; }
 center { display: block; text-align: center; unicode-bidi: isolate; }
@@ -237,6 +237,7 @@ dd { display: block; margin-left: 40px; unicode-bidi: isolate; }
 dd[dir=ltr][dir][dir] { margin-left: 0; margin-right: 40px; }
 dd[dir=rtl][dir][dir] { margin-left: 40px; margin-right: 0; }
 
+details { display: block; unicode-bidi: isolate; }
 del { text-decoration: line-through; }
 dfn { font-style: italic; }
 
@@ -297,17 +298,17 @@ form { display: block; unicode-bidi: isolate; }
 frame { display: block; }
 frameset { display: block; }
 
-h1 { display: block; font-size: 2em; font-weight: bold; -weasy-hyphens: manual; margin-bottom: .67em; margin-top: .67em; page-break-after: avoid; page-break-inside: avoid; unicode-bidi: isolate; -weasy-bookmark-level: 1; -weasy-bookmark-label: content(text); }
+h1 { display: block; font-size: 2em; font-weight: bold; hyphens: manual; margin-bottom: .67em; margin-top: .67em; page-break-after: avoid; page-break-inside: avoid; unicode-bidi: isolate; bookmark-level: 1; bookmark-label: content(text); }
 section h1 { font-size: 1.50em; margin-bottom: .83em; margin-top: .83em; }
 section section h1 { font-size: 1.17em; margin-bottom: 1.00em; margin-top: 1.00em; }
 section section section h1 { font-size: 1.00em; margin-bottom: 1.33em; margin-top: 1.33em; }
 section section section section h1 { font-size: .83em; margin-bottom: 1.67em; margin-top: 1.67em; }
 section section section section section h1 { font-size: .67em; margin-bottom: 2.33em; margin-top: 2.33em; }
-h2 { display: block; font-size: 1.50em; font-weight: bold; -weasy-hyphens: manual; margin-bottom: .83em; margin-top: .83em; page-break-after: avoid; page-break-inside: avoid; unicode-bidi: isolate; -weasy-bookmark-level: 2; -weasy-bookmark-label: content(text); }
-h3 { display: block; font-size: 1.17em; font-weight: bold; -weasy-hyphens: manual; margin-bottom: 1.00em; margin-top: 1.00em; page-break-after: avoid; page-break-inside: avoid; unicode-bidi: isolate; -weasy-bookmark-level: 3; -weasy-bookmark-label: content(text); }
-h4 { display: block; font-size: 1.00em; font-weight: bold; -weasy-hyphens: manual; margin-bottom: 1.33em; margin-top: 1.33em; page-break-after: avoid; page-break-inside: avoid; unicode-bidi: isolate; -weasy-bookmark-level: 4; -weasy-bookmark-label: content(text); }
-h5 { display: block; font-size: .83em; font-weight: bold; -weasy-hyphens: manual; margin-bottom: 1.67em; margin-top: 1.67em; page-break-after: avoid; unicode-bidi: isolate; -weasy-bookmark-level: 5; -weasy-bookmark-label: content(text); }
-h6 { display: block; font-size: .67em; font-weight: bold; -weasy-hyphens: manual; margin-bottom: 2.33em; margin-top: 2.33em; page-break-after: avoid; unicode-bidi: isolate; -weasy-bookmark-level: 6; -weasy-bookmark-label: content(text); }
+h2 { display: block; font-size: 1.50em; font-weight: bold; hyphens: manual; margin-bottom: .83em; margin-top: .83em; page-break-after: avoid; page-break-inside: avoid; unicode-bidi: isolate; bookmark-level: 2; bookmark-label: content(text); }
+h3 { display: block; font-size: 1.17em; font-weight: bold; hyphens: manual; margin-bottom: 1.00em; margin-top: 1.00em; page-break-after: avoid; page-break-inside: avoid; unicode-bidi: isolate; bookmark-level: 3; bookmark-label: content(text); }
+h4 { display: block; font-size: 1.00em; font-weight: bold; hyphens: manual; margin-bottom: 1.33em; margin-top: 1.33em; page-break-after: avoid; page-break-inside: avoid; unicode-bidi: isolate; bookmark-level: 4; bookmark-label: content(text); }
+h5 { display: block; font-size: .83em; font-weight: bold; hyphens: manual; margin-bottom: 1.67em; margin-top: 1.67em; page-break-after: avoid; unicode-bidi: isolate; bookmark-level: 5; bookmark-label: content(text); }
+h6 { display: block; font-size: .67em; font-weight: bold; hyphens: manual; margin-bottom: 2.33em; margin-top: 2.33em; page-break-after: avoid; unicode-bidi: isolate; bookmark-level: 6; bookmark-label: content(text); }
 
 head { display: none; }
 header { display: block; unicode-bidi: isolate; }
@@ -347,6 +348,7 @@ li { display: list-item; unicode-bidi: isolate; }
 link { display: none; }
 listing { display: block; font-family: monospace; margin-bottom: 1em; margin-top: 1em; unicode-bidi: isolate; white-space: pre; }
 mark { background: yellow; color: black; }
+main { display: block; unicode-bidi: isolate; }
 
 menu { display: block; list-style-type: disc; margin-bottom: 1em; margin-top: 1em; padding-left: 40px; unicode-bidi: isolate; }
 
@@ -419,8 +421,8 @@ p { display: block; margin-bottom: 1em; margin-top: 1em; unicode-bidi: isolate; 
 param { display: none; }
 plaintext { display: block; font-family: monospace; margin-bottom: 1em; margin-top: 1em; unicode-bidi: isolate; white-space: pre; }
 pre { display: block; font-family: monospace; margin-bottom: 1em; margin-top: 1em; unicode-bidi: isolate; white-space: pre; }
-q:after { content: close-quote; }
-q:before { content: open-quote; }
+q::after { content: close-quote; }
+q::before { content: open-quote; }
 rp { display: none; }
 rt { display: ruby-text; }
 ruby { display: ruby; }
@@ -515,7 +517,7 @@ video { object-fit: contain; }
 xmp { display: block; font-family: monospace; margin-bottom: 1em; margin-top: 1em; unicode-bidi: isolate; white-space: pre; }
 
 @page {
-    /* `size: auto` (the inital) is A4 portrait */
+    /* `size: auto` (the initial) is A4 portrait */
     margin: 75px;
     @top-left-corner     { text-align: right;  vertical-align:  middle }
     @top-left            { text-align: left;   vertical-align:  middle }
